@@ -73,7 +73,8 @@ for i in $(seq 1 "$ATTEMPTS"); do
       --display-name "$DISPLAY_NAME" --query 'data[0]."primary-public-ip"' \
       --raw-output 2>/dev/null)
     echo "  [OK] 抢到了！ID=$ID IP=$IP"
-    send_notify "[OK] ARM抢机成功" "区域: $AVAILABILITY_DOMAIN\n配置: $OCPUS OCPU/$MEMORY GB\nIP: ${IP:-查看控制台}\n登录: ssh -i 私钥 ubuntu@${IP:-IP}"
+    echo "arm_ip=$IP" >> "${GITHUB_OUTPUT:-/dev/null}"
+    send_notify "[OK] ARM抢机成功" "区域: $AVAILABILITY_DOMAIN\n配置: $OCPUS OCPU/$MEMORY GB\nIP: ${IP:-查看控制台}\n登录: ssh -i oracle_arm_id_rsa ubuntu@${IP:-IP}"
     exit 0
   else
     echo "  未知返回:"; echo "$RESULT" | head -5
