@@ -50,64 +50,35 @@ if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
 fi
 
 # 容量预检：调用 OCI Capacity Report，返回 readiness 状态字符串（失败返回 UNKNOWN）
+# A1.Flex 是弹性规格，必须带 instance_shape_config（ocpu/内存）才能算出容量。
 cap_status() {
   [ "$CAPACITY_PRECHECK" = "true" ] || { echo "DISABLED"; return; }
+  OCPUS="$OCPUS" MEMORY="$MEMORY" \
   AVAILABILITY_DOMAIN="$AVAILABILITY_DOMAIN" COMPARTMENT_ID="$COMPARTMENT_ID" \
   python3 - <<'PY'
 import sys, os, oci
 try:
-    # 先 introspect 出正确的字段名/类名（不同 oci-sdk 版本不同）
-    cls = oci.core.models.CreateCapacityReportShapeAvailabilityDetails
-    sys.stderr.write("CAP_ATTRS: %r\n" % [a for a in dir(cls) if not a.startswith('_')])
-    sc_cls = None
-    for n in dir(oci.core.models):
-        if 'ShapeConfig' in n:
-            sc_cls = getattr(oci.core.models, n); break
-    sys.stderr.write("SC_CLS: %r\n" % (getattr(sc_cls, '__name__', None),))
-    if sc_cls:
-        sys.stderr.write("SC_ATTRS: %r\n" % [a for a in dir(sc_cls) if not a.startswith('_')])
     cfg = oci.config.from_file()
     core = oci.core.ComputeClient(cfg)
-    # 尝试各种可能的写法
-    sa = None
-    errs = []
-    for fname in ("shape_config", "instance_shape_config", "shapeConfig"):
-        if sc_cls is None:
-            break
-        for kw in ({"ocpus": 2, "memory_in_gbs": 12}, {"ocpus": 2, "memoryInGBs": 12}):
-            try:
-                sc = sc_cls(**kw)
-                sa = cls(instance_shape="VM.Standard.A1.Flex", **{fname: sc})
-                sys.stderr.write("CAP_OK_FIELD: %s\n" % fname)
-                break
-            except Exception as e:
-                errs.append("%s:%s" % (fname, type(e).__name__))
-        if sa is not None:
-            break
-    if sa is None:
-        # 退路：不传 shape config
-        try:
-            sa = cls(instance_shape="VM.Standard.A1.Flex")
-            sys.stderr.write("CAP_FALLBACK_NO_CONFIG\n")
-        except Exception as e:
-            sys.stderr.write("CAP_ALL_FAIL: %r\n" % errs)
-            print("UNKNOWN"); raise
+    ocpus = int(os.environ["OCPUS"]); mem = int(os.environ["MEMORY"])
+    sc_cls = getattr(oci.core.models, "CapacityReportInstanceShapeConfig", None)
+    sc = sc_cls(ocpus=ocpus, memory_in_gbs=mem) if sc_cls else None
+    sa = oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
+        instance_shape="VM.Standard.A1.Flex",
+        instance_shape_config=sc) if sc is not None \
+        else oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
+        instance_shape="VM.Standard.A1.Flex")
     details = oci.core.models.CreateComputeCapacityReportDetails(
         compartment_id=os.environ["COMPARTMENT_ID"],
         availability_domain=os.environ["AVAILABILITY_DOMAIN"],
         shape_availabilities=[sa])
     rep = core.create_compute_capacity_report(create_compute_capacity_report_details=details)
-    sys.stderr.write("CAP_DATA: %r\n" % (rep.data,))
     sas = getattr(rep.data, "shape_availabilities", None)
-    if sas:
-        sa0 = sas[0]
-        st = getattr(sa0, "availability_status", None)
-        sys.stderr.write("CAP_ST: %r\n" % (st,))
-        print(st if st else "UNKNOWN")
-    else:
-        sys.stderr.write("CAP_NO_SHAPE_AVAIL\n"); print("UNKNOWN")
+    st = sas[0].availability_status if sas else "UNKNOWN"
+    sys.stderr.write("CAP_STATUS=%s\n" % st)
+    print(st if st else "UNKNOWN")
 except Exception as e:
-    sys.stderr.write("CAP_ERR %s: %s\n" % (type(e).__name__, str(e)[:500]))
+    sys.stderr.write("CAP_ERR %s: %s\n" % (type(e).__name__, str(e)[:400]))
     print("UNKNOWN")
 PY
 }
@@ -118,13 +89,11 @@ if [ "$STRICT_SKIP" = "true" ] && [ "$CAP" = "OUT_OF_HOST_CAPACITY" ]; then
   echo "明确无容量且严格模式开启，跳过本轮以省调用。"
   exit 0
 fi
-# 优化：预检结果驱动本轮策略
+# 优化：仅当报告 AVAILABLE 时本轮加量抓窗口。
+# OUT_OF_HOST_CAPACITY 常是"假阴性"（报告滞后），故不据此减尝试次数，避免漏掉真实窗口。
 if [ "$CAP" = "AVAILABLE" ]; then
   MAX_ATTEMPTS=$((MAX_ATTEMPTS + 5))
   echo "预检显示有容量，本轮加量到 $MAX_ATTEMPTS 次尝试。"
-elif [ "$CAP" = "OUT_OF_HOST_CAPACITY" ]; then
-  MAX_ATTEMPTS=$((MAX_ATTEMPTS / 2))
-  echo "预检显示无容量（非严格模式仍尝试），本轮减到 $MAX_ATTEMPTS 次省调用。"
 fi
 
 i=0
