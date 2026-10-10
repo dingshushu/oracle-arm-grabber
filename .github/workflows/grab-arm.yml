@@ -3,6 +3,7 @@ name: Grab Oracle ARM
 # 每 5 分钟一波密集尝试（一轮内连试多次，自适应调速）。
 # 比 a1-hunter 的"本地秒级常驻"少了连续轮询，但零维护、关机照跑。
 # 人工修改
+# schedule-reg-push
 on:
   schedule:
     - cron: '*/5 * * * *'   # 每 5 分钟调度（GitHub 免费仓库不限分钟数）
