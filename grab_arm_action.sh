@@ -50,22 +50,45 @@ if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
 fi
 
 # 容量预检：调用 OCI Capacity Report，返回 readiness 状态字符串（失败返回 UNKNOWN）
+# A1.Flex 是弹性规格，必须带 shape_config（ocpu/内存）才能算出容量，否则 OCI 报 InvalidParameter。
 cap_status() {
   [ "$CAPACITY_PRECHECK" = "true" ] || { echo "DISABLED"; return; }
-  python3 - "$AVAILABILITY_DOMAIN" "$COMPARTMENT_ID" <<'PY' 2>/dev/null
-import sys, oci
+  OCPUS="$OCPUS" MEMORY="$MEMORY" \
+  AVAILABILITY_DOMAIN="$AVAILABILITY_DOMAIN" COMPARTMENT_ID="$COMPARTMENT_ID" \
+  python3 - <<'PY'
+import sys, os, oci
+def get_shape_config(ocpus, mem):
+    # 兼容不同 oci-sdk 版本的类名/参数名
+    for clsname in ("CapacityReportInstanceShapeConfig", "InstanceShapeConfig"):
+        cls = getattr(oci.core.models, clsname, None)
+        if cls is None:
+            continue
+        for kw in ({"ocpus": ocpus, "memory_in_gbs": mem},
+                   {"ocpus": ocpus, "memoryInGBs": mem}):
+            try:
+                return cls(**kw)
+            except Exception:
+                pass
+    return None
 try:
     cfg = oci.config.from_file()
     core = oci.core.ComputeClient(cfg)
+    ocpus = int(os.environ["OCPUS"]); mem = int(os.environ["MEMORY"])
+    sc = get_shape_config(ocpus, mem)
+    sa = oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
+        instance_shape="VM.Standard.A1.Flex", shape_config=sc) if sc is not None \
+        else oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
+        instance_shape="VM.Standard.A1.Flex")
     details = oci.core.models.CreateComputeCapacityReportDetails(
-        compartment_id=sys.argv[2],
-        availability_domain=sys.argv[1],
-        shape_availabilities=[oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
-            instance_shape="VM.Standard.A1.Flex")]
-    )
+        compartment_id=os.environ["COMPARTMENT_ID"],
+        availability_domain=os.environ["AVAILABILITY_DOMAIN"],
+        shape_availabilities=[sa])
     rep = core.create_compute_capacity_report(create_compute_capacity_report_details=details)
-    print(rep.data.shape_availabilities[0].availability_status)
+    st = getattr(rep.data.shape_availabilities[0], "availability_status", "UNKNOWN")
+    sys.stderr.write("CAP_RAW availability_status=%r\n" % st)
+    print(st)
 except Exception as e:
+    sys.stderr.write("CAP_ERR %s: %s\n" % (type(e).__name__, str(e)[:400]))
     print("UNKNOWN")
 PY
 }
@@ -75,6 +98,14 @@ echo "== 容量预检状态: ${CAP:-UNKNOWN} =="
 if [ "$STRICT_SKIP" = "true" ] && [ "$CAP" = "OUT_OF_HOST_CAPACITY" ]; then
   echo "明确无容量且严格模式开启，跳过本轮以省调用。"
   exit 0
+fi
+# 优化：预检结果驱动本轮策略
+if [ "$CAP" = "AVAILABLE" ]; then
+  MAX_ATTEMPTS=$((MAX_ATTEMPTS + 5))
+  echo "预检显示有容量，本轮加量到 $MAX_ATTEMPTS 次尝试。"
+elif [ "$CAP" = "OUT_OF_HOST_CAPACITY" ]; then
+  MAX_ATTEMPTS=$((MAX_ATTEMPTS / 2))
+  echo "预检显示无容量（非严格模式仍尝试），本轮减到 $MAX_ATTEMPTS 次省调用。"
 fi
 
 i=0
