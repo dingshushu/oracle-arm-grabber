@@ -9,6 +9,8 @@ jobs:
   grab:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      issues: write
     env:
       # 以下为非敏感固定参数（你的主区域 ap-singapore-1）
       COMPARTMENT_ID: "ocid1.tenancy.oc1..aaaaaaaaii4jwevwldqla6tyb2wy3avachyzlhuoizmvg4wrjczdpfe5aznq"
@@ -38,7 +40,23 @@ jobs:
           printf '%s\n' "$OCI_CONFIG" > $HOME/.oci/config
 
       - name: Run grabber
+        id: grab
         env:
           SCT_KEY: ${{ secrets.SCT_KEY }}
           SSH_KEY_PUB: ${{ secrets.SSH_KEY_PUB }}
         run: bash grab_arm_action.sh
+
+      - name: Report IP to Issue
+        if: steps.grab.outputs.arm_ip != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IP="${{ steps.grab.outputs.arm_ip }}"
+          REPO="${{ github.repository }}"
+          BODY="Public IP: $IP"$'\n'"登录: ssh -i oracle_arm_id_rsa ubuntu@$IP"
+          EXISTING=$(gh issue list --repo "$REPO" --state open --search "ARM 实例已抢到 in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --repo "$REPO" --title "🎯 ARM 实例已抢到 — IP: $IP" --body "$BODY"
+          else
+            gh issue create --repo "$REPO" --title "🎯 ARM 实例已抢到 — IP: $IP" --body "$BODY"
+          fi
