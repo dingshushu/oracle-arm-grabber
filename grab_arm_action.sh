@@ -56,16 +56,47 @@ cap_status() {
   python3 - <<'PY'
 import sys, os, oci
 try:
+    # 先 introspect 出正确的字段名/类名（不同 oci-sdk 版本不同）
+    cls = oci.core.models.CreateCapacityReportShapeAvailabilityDetails
+    sys.stderr.write("CAP_ATTRS: %r\n" % [a for a in dir(cls) if not a.startswith('_')])
+    sc_cls = None
+    for n in dir(oci.core.models):
+        if 'ShapeConfig' in n:
+            sc_cls = getattr(oci.core.models, n); break
+    sys.stderr.write("SC_CLS: %r\n" % (getattr(sc_cls, '__name__', None),))
+    if sc_cls:
+        sys.stderr.write("SC_ATTRS: %r\n" % [a for a in dir(sc_cls) if not a.startswith('_')])
     cfg = oci.config.from_file()
     core = oci.core.ComputeClient(cfg)
-    sa = oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
-        instance_shape="VM.Standard.A1.Flex")
+    # 尝试各种可能的写法
+    sa = None
+    errs = []
+    for fname in ("shape_config", "instance_shape_config", "shapeConfig"):
+        if sc_cls is None:
+            break
+        for kw in ({"ocpus": 2, "memory_in_gbs": 12}, {"ocpus": 2, "memoryInGBs": 12}):
+            try:
+                sc = sc_cls(**kw)
+                sa = cls(instance_shape="VM.Standard.A1.Flex", **{fname: sc})
+                sys.stderr.write("CAP_OK_FIELD: %s\n" % fname)
+                break
+            except Exception as e:
+                errs.append("%s:%s" % (fname, type(e).__name__))
+        if sa is not None:
+            break
+    if sa is None:
+        # 退路：不传 shape config
+        try:
+            sa = cls(instance_shape="VM.Standard.A1.Flex")
+            sys.stderr.write("CAP_FALLBACK_NO_CONFIG\n")
+        except Exception as e:
+            sys.stderr.write("CAP_ALL_FAIL: %r\n" % errs)
+            print("UNKNOWN"); raise
     details = oci.core.models.CreateComputeCapacityReportDetails(
         compartment_id=os.environ["COMPARTMENT_ID"],
         availability_domain=os.environ["AVAILABILITY_DOMAIN"],
         shape_availabilities=[sa])
     rep = core.create_compute_capacity_report(create_compute_capacity_report_details=details)
-    # 完整打印返回结构，便于核对字段名（不同 SDK 版本可能不同）
     sys.stderr.write("CAP_DATA: %r\n" % (rep.data,))
     sas = getattr(rep.data, "shape_availabilities", None)
     if sas:
@@ -74,8 +105,7 @@ try:
         sys.stderr.write("CAP_ST: %r\n" % (st,))
         print(st if st else "UNKNOWN")
     else:
-        sys.stderr.write("CAP_NO_SHAPE_AVAIL\n")
-        print("UNKNOWN")
+        sys.stderr.write("CAP_NO_SHAPE_AVAIL\n"); print("UNKNOWN")
 except Exception as e:
     sys.stderr.write("CAP_ERR %s: %s\n" % (type(e).__name__, str(e)[:500]))
     print("UNKNOWN")
