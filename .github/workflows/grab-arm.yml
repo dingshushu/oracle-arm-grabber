@@ -1,5 +1,4 @@
 name: Grab Oracle ARM
-# AUTO-REG-MARKER 触发调度重新登记
 
 # 每 5 分钟一波密集尝试（一轮内连试多次，自适应调速）。
 # 比 a1-hunter 的"本地秒级常驻"少了连续轮询，但零维护、关机照跑。
@@ -21,7 +20,7 @@ concurrency:
 
 jobs:
   grab:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # 固定 LTS，避免 ubuntu-latest 于 2026-10-19 迁移 Ubuntu 26 引发意外
     timeout-minutes: 6
     permissions:
       issues: write
@@ -33,10 +32,10 @@ jobs:
       IMAGE_ID: "ocid1.image.oc1.ap-singapore-1.aaaaaaaaw75ef2chh5goomskvdznqz36cadczqelqvndbqcozc5icyig57za"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
