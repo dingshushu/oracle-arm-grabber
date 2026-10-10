@@ -1,6 +1,11 @@
 #!/bin/bash
 # Oracle Free Tier ARM 抢机脚本 —— 供 GitHub Actions 调用
-# 每轮调度内尝试若干次；抢到即发 Server酱 通知并退出。
+# 特性：
+#   1) 自适应调速：被 API 限速(429/Throttling)时自动拉大间隔退避，避免触发风控封号；
+#      正常缺货时保持紧凑节奏（5s），不浪费窗口。
+#   2) 容量预检（Compute Capacity Report）：每轮先问 Oracle 当前 AD 是否有 A1 容量，
+#      仅当明确报 OUT_OF_HOST_CAPACITY 且开启 STRICT_SKIP 才跳过本轮，
+#      默认关闭严格跳过（只记录日志），避免误杀真实可用窗口。
 set -u
 
 export SUPPRESS_LABEL_WARNING=True
@@ -11,8 +16,15 @@ DISPLAY_NAME="arm"
 OCPUS=2
 MEMORY=12
 BOOT_SIZE=100
-ATTEMPTS=6
-ATTEMPT_SLEEP=20
+
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-10}"   # 单轮最多尝试次数
+INTERVAL=8                          # 当前尝试间隔（秒），自适应调整
+MIN_INTERVAL=5
+MAX_INTERVAL=120                    # 退避上限
+
+ADAPTIVE="${ADAPTIVE:-true}"            # 自适应调速开关
+CAPACITY_PRECHECK="${CAPACITY_PRECHECK:-true}"  # 容量预检开关
+STRICT_SKIP="${STRICT_SKIP:-false}"     # 仅在明确无容量时跳过（默认关，避免误杀）
 
 SSH_FILE=$HOME/id_rsa.pub
 printf '%s\n' "${SSH_KEY_PUB:-}" > "$SSH_FILE"
@@ -37,9 +49,40 @@ if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
   exit 0
 fi
 
-for i in $(seq 1 "$ATTEMPTS"); do
+# 容量预检：调用 OCI Capacity Report，返回 readiness 状态字符串（失败返回 UNKNOWN）
+cap_status() {
+  [ "$CAPACITY_PRECHECK" = "true" ] || { echo "DISABLED"; return; }
+  python3 - "$AVAILABILITY_DOMAIN" "$COMPARTMENT_ID" <<'PY' 2>/dev/null
+import sys, oci
+try:
+    cfg = oci.config.from_file()
+    core = oci.core.ComputeClient(cfg)
+    details = oci.core.models.CreateComputeCapacityReportDetails(
+        compartment_id=sys.argv[2],
+        availability_domain=sys.argv[1],
+        shape_availabilities=[oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
+            instance_shape="VM.Standard.A1.Flex")]
+    )
+    rep = core.create_compute_capacity_report(create_compute_capacity_report_details=details)
+    print(rep.data.shape_availabilities[0].availability_status)
+except Exception as e:
+    print("UNKNOWN")
+PY
+}
+
+CAP=$(cap_status)
+echo "== 容量预检状态: ${CAP:-UNKNOWN} =="
+if [ "$STRICT_SKIP" = "true" ] && [ "$CAP" = "OUT_OF_HOST_CAPACITY" ]; then
+  echo "明确无容量且严格模式开启，跳过本轮以省调用。"
+  exit 0
+fi
+
+i=0
+while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
+  i=$((i+1))
   TS=$(date +"%Y-%m-%d %H:%M:%S")
-  echo "[$TS] 第 $i/$ATTEMPTS 次尝试..."
+  echo "[$TS] 第 $i/$MAX_ATTEMPTS 次尝试（间隔 ${INTERVAL}s）..."
+
   RESULT=$(oci --no-retry compute instance launch --output json \
     --availability-domain "$AVAILABILITY_DOMAIN" \
     --compartment-id "$COMPARTMENT_ID" \
@@ -53,7 +96,8 @@ for i in $(seq 1 "$ATTEMPTS"); do
     --ssh-authorized-keys-file "$SSH_FILE" 2>&1)
 
   if echo "$RESULT" | grep -qiE "Out of host capacity|Out of capacity"; then
-    echo "  没货，继续..."
+    echo "  没货，保持紧凑节奏。"
+    [ "$ADAPTIVE" = "true" ] && INTERVAL=$MIN_INTERVAL
   elif echo "$RESULT" | grep -qiE "LimitExceeded"; then
     echo "  配额异常，复检是否已有实例..."
     sleep 5
@@ -64,8 +108,11 @@ for i in $(seq 1 "$ATTEMPTS"); do
       echo "已存在实例 $EX"; send_notify "ARM实例已存在" "ID: $EX"; exit 0
     fi
     echo "  配额已满，本轮停止。"; break
-  elif echo "$RESULT" | grep -qiE "TooManyRequests|rate limit"; then
-    echo "  被限速，稍等..."; sleep 30
+  elif echo "$RESULT" | grep -qiE "TooManyRequests|rate limit|Throttling"; then
+    echo "  被限速，退避拉大间隔 (${INTERVAL}s -> $((INTERVAL + 30 > MAX_INTERVAL ? MAX_INTERVAL : INTERVAL + 30))s)..."
+    [ "$ADAPTIVE" = "true" ] && INTERVAL=$((INTERVAL + 30 > MAX_INTERVAL ? MAX_INTERVAL : INTERVAL + 30))
+    sleep "$INTERVAL"
+    continue
   elif echo "$RESULT" | grep -qi "provisioning"; then
     ID=$(echo "$RESULT" | grep -oP '"id":\s*"ocid1\.instance[^"]*"' | head -1 | grep -oP 'ocid1\.instance[^"]*')
     sleep 10
@@ -79,8 +126,8 @@ for i in $(seq 1 "$ATTEMPTS"); do
   else
     echo "  未知返回:"; echo "$RESULT" | head -5
   fi
-  [ "$i" -lt "$ATTEMPTS" ] && sleep "$ATTEMPT_SLEEP"
+  [ "$i" -lt "$MAX_ATTEMPTS" ] && sleep "$INTERVAL"
 done
 
-echo "本轮未抢到，等待下次调度。"
+echo "本轮未抢到，等待下次调度（当前节奏 ${INTERVAL}s，下轮据此继续）。"
 exit 0
