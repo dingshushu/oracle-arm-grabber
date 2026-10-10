@@ -1,0 +1,44 @@
+name: Grab Oracle ARM
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # 每 10 分钟一轮（一轮内连试 6 次）
+  workflow_dispatch:         # 允许手动点一下立即运行（测试用）
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # 以下为非敏感固定参数（你的主区域 ap-singapore-1）
+      COMPARTMENT_ID: "ocid1.tenancy.oc1..aaaaaaaaii4jwevwldqla6tyb2wy3avachyzlhuoizmvg4wrjczdpfe5aznq"
+      AVAILABILITY_DOMAIN: "bThc:AP-SINGAPORE-1-AD-1"
+      SUBNET_ID: "ocid1.subnet.oc1.ap-singapore-1.aaaaaaaa2dnalbqseumn75ga3klzgpgbyk7jgh6r6riidtehul22yhauxtna"
+      IMAGE_ID: "ocid1.image.oc1.ap-singapore-1.aaaaaaaaw75ef2chh5goomskvdznqz36cadczqelqvndbqcozc5icyig57za"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OCI CLI
+        run: pip install oci-cli
+
+      - name: Write OCI config & key
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+        run: |
+          mkdir -p $HOME/.oci
+          printf '%s\n' "$OCI_KEY" > $HOME/oci_key.pem
+          chmod 600 $HOME/oci_key.pem
+          printf '%s\n' "$OCI_CONFIG" > $HOME/.oci/config
+
+      - name: Run grabber
+        env:
+          SCT_KEY: ${{ secrets.SCT_KEY }}
+          SSH_KEY_PUB: ${{ secrets.SSH_KEY_PUB }}
+        run: bash grab_arm_action.sh
