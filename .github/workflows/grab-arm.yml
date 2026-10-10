@@ -6,6 +6,12 @@ on:
   schedule:
     - cron: '*/5 * * * *'   # 每 5 分钟调度（GitHub 免费仓库不限分钟数）
   workflow_dispatch:         # 允许手动点一下立即运行（测试用）
+    inputs:
+      strict_skip:
+        description: '严格模式：容量预检明确无货时直接跳过本轮'
+        type: boolean
+        required: false
+        default: false
 
 # 同一时间只跑一个实例，避免重叠造成重复 API 调用、被限流
 concurrency:
@@ -53,7 +59,7 @@ jobs:
           SSH_KEY_PUB: ${{ secrets.SSH_KEY_PUB }}
           ADAPTIVE: "true"            # 自适应调速：被限速自动退避
           CAPACITY_PRECHECK: "true"   # 容量预检：每轮先查 Capacity Report
-          STRICT_SKIP: "false"        # 默认不跳过（防误杀）；想省调用改为 true
+          STRICT_SKIP: ${{ github.event.inputs.strict_skip || 'false' }}   # 默认不跳过（防误杀）；手动可勾选严格模式
         run: bash grab_arm_action.sh
 
       - name: Report IP to Issue
