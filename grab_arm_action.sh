@@ -50,45 +50,34 @@ if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
 fi
 
 # 容量预检：调用 OCI Capacity Report，返回 readiness 状态字符串（失败返回 UNKNOWN）
-# A1.Flex 是弹性规格，必须带 shape_config（ocpu/内存）才能算出容量，否则 OCI 报 InvalidParameter。
 cap_status() {
   [ "$CAPACITY_PRECHECK" = "true" ] || { echo "DISABLED"; return; }
-  OCPUS="$OCPUS" MEMORY="$MEMORY" \
   AVAILABILITY_DOMAIN="$AVAILABILITY_DOMAIN" COMPARTMENT_ID="$COMPARTMENT_ID" \
   python3 - <<'PY'
 import sys, os, oci
-def get_shape_config(ocpus, mem):
-    # 兼容不同 oci-sdk 版本的类名/参数名
-    for clsname in ("CapacityReportInstanceShapeConfig", "InstanceShapeConfig"):
-        cls = getattr(oci.core.models, clsname, None)
-        if cls is None:
-            continue
-        for kw in ({"ocpus": ocpus, "memory_in_gbs": mem},
-                   {"ocpus": ocpus, "memoryInGBs": mem}):
-            try:
-                return cls(**kw)
-            except Exception:
-                pass
-    return None
 try:
     cfg = oci.config.from_file()
     core = oci.core.ComputeClient(cfg)
-    ocpus = int(os.environ["OCPUS"]); mem = int(os.environ["MEMORY"])
-    sc = get_shape_config(ocpus, mem)
     sa = oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
-        instance_shape="VM.Standard.A1.Flex", shape_config=sc) if sc is not None \
-        else oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
         instance_shape="VM.Standard.A1.Flex")
     details = oci.core.models.CreateComputeCapacityReportDetails(
         compartment_id=os.environ["COMPARTMENT_ID"],
         availability_domain=os.environ["AVAILABILITY_DOMAIN"],
         shape_availabilities=[sa])
     rep = core.create_compute_capacity_report(create_compute_capacity_report_details=details)
-    st = getattr(rep.data.shape_availabilities[0], "availability_status", "UNKNOWN")
-    sys.stderr.write("CAP_RAW availability_status=%r\n" % st)
-    print(st)
+    # 完整打印返回结构，便于核对字段名（不同 SDK 版本可能不同）
+    sys.stderr.write("CAP_DATA: %r\n" % (rep.data,))
+    sas = getattr(rep.data, "shape_availabilities", None)
+    if sas:
+        sa0 = sas[0]
+        st = getattr(sa0, "availability_status", None)
+        sys.stderr.write("CAP_ST: %r\n" % (st,))
+        print(st if st else "UNKNOWN")
+    else:
+        sys.stderr.write("CAP_NO_SHAPE_AVAIL\n")
+        print("UNKNOWN")
 except Exception as e:
-    sys.stderr.write("CAP_ERR %s: %s\n" % (type(e).__name__, str(e)[:400]))
+    sys.stderr.write("CAP_ERR %s: %s\n" % (type(e).__name__, str(e)[:500]))
     print("UNKNOWN")
 PY
 }
