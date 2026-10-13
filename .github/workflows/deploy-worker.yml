@@ -1,0 +1,76 @@
+name: Deploy Dispatch Worker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy worker via Cloudflare API
+        env:
+          CF_TOKEN: ${{ secrets.CF_TOKEN }}
+          GH_APP_PEM: ${{ secrets.GH_APP_PEM }}
+        run: |
+          set -euo pipefail
+          API="https://api.cloudflare.com/client/v4"
+          SCRIPT_NAME="oracle-arm-grabber-dispatch"
+
+          echo "== 1) 获取 Account ID =="
+          ACCOUNT_ID=$(curl -sS "$API/accounts" -H "Authorization: Bearer $CF_TOKEN" \
+            | python3 -c "import sys,json
+          d=json.load(sys.stdin)
+          res=d.get('result') or []
+          print(res[0].get('id','') if res else '')")
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "FAILED: 无法获取 account_id —— CF_TOKEN 无效或无账户权限"
+            exit 1
+          fi
+          echo "account_id=$ACCOUNT_ID"
+
+          echo "== 2) 生成 metadata（4 变量 + 4 Secret）=="
+          python3 - <<'PYEOF'
+          import json, os
+          pem = os.environ["GH_APP_PEM"].strip()
+          meta = {
+            "main_module": "worker.js",
+            "bindings": [
+              {"name": "GH_REPO",            "type": "plain_text", "text": "dingshushu/oracle-arm-grabber"},
+              {"name": "GH_REF",             "type": "plain_text", "text": "main"},
+              {"name": "GH_WORKFLOW",        "type": "plain_text", "text": "grab-oracle-arm.yml"},
+              {"name": "GH_WORKFLOW_AMD",    "type": "plain_text", "text": "grab-amd.yml"},
+              {"name": "GH_APP_ID",          "type": "secret_text", "text": "5268332"},
+              {"name": "GH_INSTALLATION_ID", "type": "secret_text", "text": "170103729"},
+              {"name": "GH_APP_PEM",         "type": "secret_text", "text": pem},
+              {"name": "WORKER_SECRET",      "type": "secret_text", "text": "test123"},
+            ],
+          }
+          with open("metadata.json", "w") as f:
+              json.dump(meta, f)
+          print("metadata OK, bindings =", len(meta["bindings"]))
+          PYEOF
+
+          echo "== 3) 上传并部署（PUT 即刻生效）=="
+          cp cf-dispatch-worker.js worker.js
+          RESP=$(curl -sS -w "\nHTTP_CODE=%{http_code}" -X PUT \
+            "$API/accounts/$ACCOUNT_ID/workers/scripts/$SCRIPT_NAME" \
+            -H "Authorization: Bearer $CF_TOKEN" \
+            -F "metadata=<metadata.json;type=application/json" \
+            -F "worker.js=@worker.js;type=application/javascript+module" || true)
+          echo "$RESP" | tail -3
+          if echo "$RESP" | grep -q '"success":true'; then
+            echo "DEPLOY_OK"
+          else
+            echo "DEPLOY_FAILED"
+            exit 1
+          fi
+
+          echo "== 4) 核对 bindings 是否全部生效 =="
+          curl -sS "$API/accounts/$ACCOUNT_ID/workers/scripts/$SCRIPT_NAME/settings" \
+            -H "Authorization: Bearer $CF_TOKEN" \
+            | python3 -c "import sys,json
+          d=json.load(sys.stdin)
+          for b in d.get('result',{}).get('bindings',[]):
+              print('  -', b.get('name'), '=', b.get('type'))"
