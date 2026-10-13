@@ -6,6 +6,8 @@
 #   2) 容量预检（Compute Capacity Report）：每轮先问 Oracle 当前 AD 是否有 A1 容量，
 #      仅当明确报 OUT_OF_HOST_CAPACITY 且开启 STRICT_SKIP 才跳过本轮，
 #      默认关闭严格跳过（只记录日志），避免误杀真实可用窗口。
+#   3) 全 AD 扫描 + 跨 AD 切换（MULTI_AD）：动态列出 tenancy 下所有 AD 并逐个探测容量，
+#      主 AD 无货但备用 AD 有货时，自动切换到有货 AD（需该 AD 有可用子网）。
 set -u
 
 export SUPPRESS_LABEL_WARNING=True
@@ -25,6 +27,7 @@ MAX_INTERVAL=120                    # 退避上限
 ADAPTIVE="${ADAPTIVE:-true}"            # 自适应调速开关
 CAPACITY_PRECHECK="${CAPACITY_PRECHECK:-true}"  # 容量预检开关
 STRICT_SKIP="${STRICT_SKIP:-false}"     # 仅在明确无容量时跳过（默认关，避免误杀）
+MULTI_AD="${MULTI_AD:-true}"            # 全 AD 扫描 + 跨 AD 切换开关
 
 SSH_FILE=$HOME/id_rsa.pub
 printf '%s\n' "${SSH_KEY_PUB:-}" > "$SSH_FILE"
@@ -51,10 +54,11 @@ fi
 
 # 容量预检：调用 OCI Capacity Report，返回 readiness 状态字符串（失败返回 UNKNOWN）
 # A1.Flex 是弹性规格，必须带 instance_shape_config（ocpu/内存）才能算出容量。
-cap_status() {
+cap_status_for_ad() {
+  local ad="$1"
   [ "$CAPACITY_PRECHECK" = "true" ] || { echo "DISABLED"; return; }
   OCPUS="$OCPUS" MEMORY="$MEMORY" \
-  AVAILABILITY_DOMAIN="$AVAILABILITY_DOMAIN" COMPARTMENT_ID="$COMPARTMENT_ID" \
+  AVAILABILITY_DOMAIN="$ad" COMPARTMENT_ID="$COMPARTMENT_ID" \
   python3 - <<'PY'
 import sys, os, oci
 try:
@@ -83,8 +87,8 @@ except Exception as e:
 PY
 }
 
-CAP=$(cap_status)
-echo "== 容量预检状态: ${CAP:-UNKNOWN} =="
+CAP=$(cap_status_for_ad "$AVAILABILITY_DOMAIN")
+echo "== 容量预检状态(主AD): ${CAP:-UNKNOWN} =="
 if [ "$STRICT_SKIP" = "true" ] && [ "$CAP" = "OUT_OF_HOST_CAPACITY" ]; then
   echo "明确无容量且严格模式开启，跳过本轮以省调用。"
   exit 0
@@ -96,21 +100,75 @@ if [ "$CAP" = "AVAILABLE" ]; then
   echo "预检显示有容量，本轮加量到 $MAX_ATTEMPTS 次尝试。"
 fi
 
+# ===== 全 AD 扫描 + 跨 AD 切换 =====
+# 动态列出 tenancy 下所有 AD（不硬编码 AD 名），逐个探测 A1.Flex 容量。
+# 主 AD 无货但备用 AD 有货时切换目标；找不到子网则只告警、维持主 AD。
+ALT_AD=""
+TARGET_AD="$AVAILABILITY_DOMAIN"
+TARGET_SUBNET="$SUBNET_ID"
+
+find_subnet_in_ad() {
+  # 在指定 AD 中找可用子网；主子网若是区域性子网(REGIONAL)则任何 AD 可用
+  local ad="$1" vcn scope
+  vcn=$(oci network subnet get --subnet-id "$SUBNET_ID" \
+        --query 'data."vcn-id"' --raw-output 2>/dev/null)
+  [ -n "$vcn" ] && [ "$vcn" != "None" ] || return 0
+  scope=$(oci network subnet get --subnet-id "$SUBNET_ID" \
+          --query 'data.scope' --raw-output 2>/dev/null)
+  if [ "$scope" = "REGIONAL" ]; then
+    echo "$SUBNET_ID"; return 0
+  fi
+  oci network subnet list --compartment-id "$COMPARTMENT_ID" --vcn-id "$vcn" \
+    --query "data[?\"availability-domain\"=='$ad'].id | [0]" --raw-output 2>/dev/null
+}
+
+if [ "$MULTI_AD" = "true" ]; then
+  ALL_ADS=$(oci iam availability-domain list --compartment-id "$COMPARTMENT_ID" \
+            --query 'data[*].name' --raw-output 2>/dev/null)
+  if [ -z "$ALL_ADS" ]; then
+    echo "（AD 列表获取失败，跳过全 AD 扫描）"
+  else
+    echo "== 全 AD 容量扫描 =="
+    for ad in $ALL_ADS; do
+      st=$(cap_status_for_ad "$ad" 2>/dev/null)
+      echo "  AD_STATUS:${ad}:${st}"
+      if [ "$st" = "AVAILABLE" ] && [ "$ad" != "$AVAILABILITY_DOMAIN" ]; then
+        ALT_AD="$ad"
+      fi
+    done
+  fi
+fi
+
+if [ -n "$ALT_AD" ] && [ "$CAP" = "OUT_OF_HOST_CAPACITY" ]; then
+  echo "== 发现备用 AD 有容量: $ALT_AD，尝试切换 =="
+  ALT_SUBNET=$(find_subnet_in_ad "$ALT_AD")
+  if [ -n "$ALT_SUBNET" ] && [ "$ALT_SUBNET" != "None" ]; then
+    TARGET_AD="$ALT_AD"
+    TARGET_SUBNET="$ALT_SUBNET"
+    MAX_ATTEMPTS=$((MAX_ATTEMPTS + 5))
+    echo "== 已切换目标: $TARGET_AD（子网 $TARGET_SUBNET），本轮加量到 $MAX_ATTEMPTS 次 =="
+    send_notify "ARM备用AD有货" "主AD无货，已切换目标: $TARGET_AD"
+  else
+    echo "== 备用 AD $ALT_AD 有货但无可用子网，维持主 AD =="
+    send_notify "ARM备用AD有货(无子网)" "$ALT_AD 有容量但该AD无子网，需手工创建后重启抢机"
+  fi
+fi
+
 i=0
 while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
   i=$((i+1))
   TS=$(date +"%Y-%m-%d %H:%M:%S")
-  echo "[$TS] 第 $i/$MAX_ATTEMPTS 次尝试（间隔 ${INTERVAL}s）..."
+  echo "[$TS] 第 $i/$MAX_ATTEMPTS 次尝试（目标 $TARGET_AD，间隔 ${INTERVAL}s）..."
 
   RESULT=$(oci --no-retry compute instance launch --output json \
-    --availability-domain "$AVAILABILITY_DOMAIN" \
+    --availability-domain "$TARGET_AD" \
     --compartment-id "$COMPARTMENT_ID" \
     --shape "VM.Standard.A1.Flex" \
     --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY}" \
     --display-name "$DISPLAY_NAME" \
     --image-id "$IMAGE_ID" \
     --boot-volume-size-in-gbs "$BOOT_SIZE" \
-    --subnet-id "$SUBNET_ID" \
+    --subnet-id "$TARGET_SUBNET" \
     --assign-public-ip true \
     --ssh-authorized-keys-file "$SSH_FILE" 2>&1)
 
@@ -140,7 +198,7 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
       --raw-output 2>/dev/null)
     echo "  [OK] 抢到了！ID=$ID IP=$IP"
     echo "arm_ip=$IP" >> "${GITHUB_OUTPUT:-/dev/null}"
-    send_notify "[OK] ARM抢机成功" "区域: $AVAILABILITY_DOMAIN\n配置: $OCPUS OCPU/$MEMORY GB\nIP: ${IP:-查看控制台}\n登录: ssh -i oracle_arm_id_rsa ubuntu@${IP:-IP}"
+    send_notify "[OK] ARM抢机成功" "区域: $TARGET_AD\n配置: $OCPUS OCPU/$MEMORY GB\nIP: ${IP:-查看控制台}\n登录: ssh -i oracle_arm_id_rsa ubuntu@${IP:-IP}"
     exit 0
   else
     echo "  未知返回:"; echo "$RESULT" | head -5
