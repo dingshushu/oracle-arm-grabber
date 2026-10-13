@@ -14,9 +14,10 @@ jobs:
           CF_TOKEN: ${{ secrets.CF_TOKEN }}
           GH_APP_PEM: ${{ secrets.GH_APP_PEM }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           API="https://api.cloudflare.com/client/v4"
           SCRIPT_NAME="oracle-arm-grabber-dispatch"
+          WORKER_URL="https://oracle-arm-grabber-dispatch.dantion.workers.dev"
 
           echo "== 1) 获取 Account ID =="
           ACCOUNT_ID=$(curl -sS "$API/accounts" -H "Authorization: Bearer $CF_TOKEN" \
@@ -52,25 +53,45 @@ jobs:
           print("metadata OK, bindings =", len(meta["bindings"]))
           PYEOF
 
-          echo "== 3) 上传并部署（PUT 即刻生效）=="
+          echo "== 3) 上传并部署 =="
           cp cf-dispatch-worker.js worker.js
-          RESP=$(curl -sS -w "\nHTTP_CODE=%{http_code}" -X PUT \
+          HTTP=$(curl -sS -o cf_response.json -w "%{http_code}" -X PUT \
             "$API/accounts/$ACCOUNT_ID/workers/scripts/$SCRIPT_NAME" \
             -H "Authorization: Bearer $CF_TOKEN" \
             -F "metadata=<metadata.json;type=application/json" \
-            -F "worker.js=@worker.js;type=application/javascript+module" || true)
-          echo "$RESP" | tail -3
-          if echo "$RESP" | grep -q '"success":true'; then
-            echo "DEPLOY_OK"
-          else
-            echo "DEPLOY_FAILED"
-            exit 1
-          fi
+            -F "worker.js=@worker.js;type=application/javascript+module")
+          echo "HTTP_CODE=$HTTP"
+          echo "--- 完整响应体 ---"
+          cat cf_response.json
+          echo ""
+          echo "--- 解析结果 ---"
+          python3 -c "import sys,json
+          d=json.load(open('cf_response.json'))
+          print('success =', d.get('success'))
+          if d.get('errors'): print('errors =', d['errors'])
+          sys.exit(0 if d.get('success') else 1)" || { echo "DEPLOY_FAILED"; exit 1; }
+          echo "DEPLOY_OK"
 
-          echo "== 4) 核对 bindings 是否全部生效 =="
+          echo "== 4) 核对 bindings =="
           curl -sS "$API/accounts/$ACCOUNT_ID/workers/scripts/$SCRIPT_NAME/settings" \
             -H "Authorization: Bearer $CF_TOKEN" \
             | python3 -c "import sys,json
           d=json.load(sys.stdin)
-          for b in d.get('result',{}).get('bindings',[]):
-              print('  -', b.get('name'), '=', b.get('type'))"
+          bs=d.get('result',{}).get('bindings',[])
+          for b in bs: print('  -', b.get('name'), '=', b.get('type'))
+          names=[b.get('name') for b in bs]
+          need=['GH_REPO','GH_REF','GH_WORKFLOW','GH_WORKFLOW_AMD','GH_APP_ID','GH_INSTALLATION_ID','GH_APP_PEM','WORKER_SECRET']
+          miss=[n for n in need if n not in names]
+          if miss:
+              print('MISSING:', miss); sys.exit(1)
+          print('ALL_8_BINDINGS_OK')" || { echo "BINDINGS_CHECK_FAILED"; exit 1; }
+
+          echo "== 5) 功能性测试：直连 Worker（target=amd）=="
+          FUNC=$(curl -sS --max-time 30 "$WORKER_URL/?secret=test123&target=amd")
+          echo "worker响应: $FUNC"
+          if echo "$FUNC" | grep -q "grab-amd.yml"; then
+            echo "FUNC_OK: 新 Worker 已生效（target=amd 正确路由到 grab-amd.yml）"
+          else
+            echo "FUNC_FAIL: 响应中未出现 grab-amd.yml —— 线上可能仍是旧 Worker"
+            exit 1
+          fi
