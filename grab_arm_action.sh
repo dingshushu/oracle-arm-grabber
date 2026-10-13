@@ -3,6 +3,8 @@
 # 特性：
 #   1) 自适应调速：被 API 限速(429/Throttling)时自动拉大间隔退避，避免触发风控封号；
 #      正常缺货时保持紧凑节奏（5s），不浪费窗口。
+#   1b) 尝试次数自动调整：单轮时间预算(默认210s) + 连续限流上限(默认3次)双保险，
+#       限流严重时提前收工，畅通时打满 MAX_ATTEMPTS——无需手改次数。
 #   2) 容量预检（Compute Capacity Report）：每轮先问 Oracle 当前 AD 是否有 A1 容量，
 #      仅当明确报 OUT_OF_HOST_CAPACITY 且开启 STRICT_SKIP 才跳过本轮，
 #      默认关闭严格跳过（只记录日志），避免误杀真实可用窗口。
@@ -19,7 +21,9 @@ OCPUS=2
 MEMORY=12
 BOOT_SIZE=100
 
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-10}"   # 单轮最多尝试次数
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-10}"   # 单轮尝试次数上限（硬顶）
+TIME_BUDGET="${TIME_BUDGET:-210}"    # 单轮时间预算(秒)：到点自动收工，保证跑进 5 分钟调度间隔
+MAX_THROTTLE_STREAK="${MAX_THROTTLE_STREAK:-3}"  # 连续被限流上限：超过说明 OCI 在压速率，提前收工
 INTERVAL=8                          # 当前尝试间隔（秒），自适应调整
 MIN_INTERVAL=5
 MAX_INTERVAL=120                    # 退避上限
@@ -162,10 +166,19 @@ if [ -n "$ALT_AD" ] && [ "$CAP" = "OUT_OF_HOST_CAPACITY" ]; then
 fi
 
 i=0
+THROTTLE_STREAK=0
+START_TS=$(date +%s)
 while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
+  # 自动调整之一：时间预算。无论还剩多少次，到点就收工，
+  # 保证单轮稳定跑进 5 分钟调度间隔内（job 超时 6 分钟，留足 setup 余量）。
+  ELAPSED=$(( $(date +%s) - START_TS ))
+  if [ "$ELAPSED" -ge "$TIME_BUDGET" ]; then
+    echo "  已跑 ${ELAPSED}s，达到单轮时间预算 ${TIME_BUDGET}s，提前收工。"
+    break
+  fi
   i=$((i+1))
   TS=$(date +"%Y-%m-%d %H:%M:%S")
-  echo "[$TS] 第 $i/$MAX_ATTEMPTS 次尝试（目标 $TARGET_AD，间隔 ${INTERVAL}s）..."
+  echo "[$TS] 第 $i/$MAX_ATTEMPTS 次尝试（目标 $TARGET_AD，间隔 ${INTERVAL}s，已用 ${ELAPSED}s）..."
 
   RESULT=$(oci --no-retry compute instance launch --output json \
     --availability-domain "$TARGET_AD" \
@@ -181,6 +194,7 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
 
   if echo "$RESULT" | grep -qiE "Out of host capacity|Out of capacity"; then
     echo "  没货，保持紧凑节奏。"
+    THROTTLE_STREAK=0
     [ "$ADAPTIVE" = "true" ] && INTERVAL=$MIN_INTERVAL
   elif echo "$RESULT" | grep -qiE "LimitExceeded"; then
     echo "  配额异常，复检是否已有实例..."
@@ -193,8 +207,13 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
     fi
     echo "  配额已满，本轮停止。"; break
   elif echo "$RESULT" | grep -qiE "TooManyRequests|rate limit|Throttling"; then
-    echo "  被限速，退避拉大间隔 (${INTERVAL}s -> $((INTERVAL + 30 > MAX_INTERVAL ? MAX_INTERVAL : INTERVAL + 30))s)..."
+    THROTTLE_STREAK=$((THROTTLE_STREAK + 1))
+    echo "  被限速，退避拉大间隔 (${INTERVAL}s -> $((INTERVAL + 30 > MAX_INTERVAL ? MAX_INTERVAL : INTERVAL + 30))s)...（连续第 ${THROTTLE_STREAK}/${MAX_THROTTLE_STREAK} 次）"
     [ "$ADAPTIVE" = "true" ] && INTERVAL=$((INTERVAL + 30 > MAX_INTERVAL ? MAX_INTERVAL : INTERVAL + 30))
+    if [ "$THROTTLE_STREAK" -ge "$MAX_THROTTLE_STREAK" ]; then
+      echo "  连续 ${MAX_THROTTLE_STREAK} 次被限流，OCI 正在压我们的速率，提前收工等下一轮。"
+      break
+    fi
     sleep "$INTERVAL"
     continue
   elif echo "$RESULT" | grep -qi "provisioning"; then
@@ -213,5 +232,6 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
   [ "$i" -lt "$MAX_ATTEMPTS" ] && sleep "$INTERVAL"
 done
 
-echo "本轮未抢到，等待下次调度（当前节奏 ${INTERVAL}s，下轮据此继续）。"
+ELAPSED=$(( $(date +%s) - START_TS ))
+echo "本轮未抢到：实际尝试 $i/$MAX_ATTEMPTS 次，用时 ${ELAPSED}s，当前节奏 ${INTERVAL}s，下轮据此继续。"
 exit 0
