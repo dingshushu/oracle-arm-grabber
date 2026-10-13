@@ -123,8 +123,15 @@ find_subnet_in_ad() {
 }
 
 if [ "$MULTI_AD" = "true" ]; then
+  # 用 --output json + python 解析，规避 --raw-output 对数组的格式怪癖
+  # （实测 --raw-output 会输出带引号/括号的 JSON 数组，导致 AD 名非法）
   ALL_ADS=$(oci iam availability-domain list --compartment-id "$COMPARTMENT_ID" \
-            --query 'data[*].name' --raw-output 2>/dev/null)
+            --output json 2>/dev/null \
+            | python3 -c "import sys,json
+try:
+    [print(a['name']) for a in json.load(sys.stdin).get('data',[])]
+except Exception:
+    pass")
   if [ -z "$ALL_ADS" ]; then
     echo "（AD 列表获取失败，跳过全 AD 扫描）"
   else
