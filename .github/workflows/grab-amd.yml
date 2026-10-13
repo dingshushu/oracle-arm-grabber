@@ -1,0 +1,77 @@
+name: Grab Oracle AMD
+
+# AMD 免费额度抢机（VM.Standard.E2.1.Micro x 2，与 ARM 额度独立）
+# E2.1.Micro 容量通常充足，15 分钟一轮足够；触发实际由 cron-job.org -> Cloudflare
+# Worker(GitHub App 身份) 打 dispatch 完成，本 schedule 仅作后备。
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'   # 每 15 分钟（偏移避开整点）
+  workflow_dispatch:               # 允许手动点一下立即运行（测试用）
+    inputs:
+      amd_count:
+        description: '抢夺数量（默认 2，即免费额度上限）'
+        type: string
+        required: false
+        default: '2'
+
+concurrency:
+  group: grab-amd
+  cancel-in-progress: false
+
+jobs:
+  grab:
+    runs-on: ubuntu-24.04   # 固定 LTS，避免 ubuntu-latest 迁移引发意外
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      # 以下为非敏感固定参数（主区域 ap-singapore-1，与 ARM 共用 VCN/子网）
+      COMPARTMENT_ID: "ocid1.tenancy.oc1..aaaaaaaaii4jwevwldqla6tyb2wy3avachyzlhuoizmvg4wrjczdpfe5aznq"
+      AVAILABILITY_DOMAIN: "bThc:AP-SINGAPORE-1-AD-1"
+      SUBNET_ID: "ocid1.subnet.oc1.ap-singapore-1.aaaaaaaa2dnalbqseumn75ga3klzgpgbyk7jgh6r6riidtehul22yhauxtna"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install OCI CLI (含 oci Python SDK)
+        run: pip install oci-cli
+
+      - name: Write OCI config & key
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+        run: |
+          mkdir -p $HOME/.oci
+          printf '%s\n' "$OCI_KEY" > $HOME/oci_key.pem
+          chmod 600 $HOME/oci_key.pem
+          printf '%s\n' "$OCI_CONFIG" > $HOME/.oci/config
+
+      - name: Run grabber
+        id: grab
+        env:
+          SCT_KEY: ${{ secrets.SCT_KEY }}
+          SSH_KEY_PUB: ${{ secrets.SSH_KEY_PUB }}
+          AMD_COUNT: ${{ github.event.inputs.amd_count || '2' }}
+        run: bash grab_amd_action.sh
+
+      - name: Report IP to Issue
+        if: steps.grab.outputs.amd_ip != '' || steps.grab.outputs.amd_ip_2 != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          IP1="${{ steps.grab.outputs.amd_ip }}"
+          IP2="${{ steps.grab.outputs.amd_ip_2 }}"
+          REPO="${{ github.repository }}"
+          BODY="Public IP1: ${IP1:-无}"$'\n'"Public IP2: ${IP2:-无}"$'\n'"登录: ssh -i oracle_arm_id_rsa ubuntu@<IP>"
+          EXISTING=$(gh issue list --repo "$REPO" --state open --search "AMD 实例已抢到 in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --repo "$REPO" --title "🎯 AMD 实例已抢到 — IP: ${IP1:-无} / ${IP2:-无}" --body "$BODY"
+          else
+            gh issue create --repo "$REPO" --title "🎯 AMD 实例已抢到 — IP: ${IP1:-无} / ${IP2:-无}" --body "$BODY"
+          fi
