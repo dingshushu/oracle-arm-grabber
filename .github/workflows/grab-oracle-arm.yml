@@ -1,5 +1,4 @@
 name: Grab Oracle ARM
-# push-reg 2026-10-11
 
 # 每 5 分钟一波密集尝试（一轮内连试多次，自适应调速）。
 # 比 a1-hunter 的"本地秒级常驻"少了连续轮询，但零维护、关机照跑。
@@ -60,6 +59,7 @@ jobs:
           SSH_KEY_PUB: ${{ secrets.SSH_KEY_PUB }}
           ADAPTIVE: "true"            # 自适应调速：被限速自动退避
           CAPACITY_PRECHECK: "true"   # 容量预检：每轮先查 Capacity Report
+          MAX_ATTEMPTS: "6"           # 单轮尝试次数（预检有货时自动加量到 11）
           STRICT_SKIP: ${{ github.event.inputs.strict_skip || 'false' }}   # 默认不跳过（防误杀）；手动可勾选严格模式
         run: bash grab_arm_action.sh
 
