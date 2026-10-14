@@ -28,6 +28,8 @@ jobs:
           TENANCY=$(awk -F= '/^tenancy=/{print $2}' $HOME/.oci/config | tr -d ' ')
           echo "===== TENANCY ====="
           oci iam tenancy get --tenancy-id "$TENANCY" --query 'data.{name:name,id:id,home_region:"home-region-key"}' --output json
+          echo "===== DOMAINS ====="
+          oci iam domain list --compartment-id "$TENANCY" --query 'data[].{name:name,type:"domain-type",state:"lifecycle-state",url:url}' --output json
           echo "===== USERS (登录名) ====="
           oci iam user list --compartment-id "$TENANCY" --query 'data[].{name:name,email:email,state:"lifecycle-state"}' --output json
           echo "===== REGIONS ====="
