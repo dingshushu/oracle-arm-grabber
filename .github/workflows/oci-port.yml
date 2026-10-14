@@ -1,0 +1,76 @@
+name: OCI Port Manager
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'open = 放行端口, close = 关闭端口'
+        type: choice
+        options: [open, close]
+        required: true
+      ports:
+        description: '逗号分隔端口号，如 80,443'
+        required: true
+        default: '80,443'
+
+jobs:
+  port:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install OCI CLI
+        run: pip install oci-cli
+      - name: Write OCI config & key
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+        run: |
+          mkdir -p $HOME/.oci
+          printf '%s\n' "$OCI_KEY" > $HOME/oci_key.pem
+          chmod 600 $HOME/oci_key.pem
+          printf '%s\n' "$OCI_CONFIG" > $HOME/.oci/config
+      - name: Manage security list ports
+        env:
+          ACTION: ${{ inputs.action }}
+          PORTS: ${{ inputs.ports }}
+        run: |
+          set -e
+          SL="ocid1.securitylist.oc1.ap-singapore-1.aaaaaaaaozhglrhji2a4wcssgditmqp7jvhbjzcexrqhufp73td3z5rympmq"
+          python3 - <<'PYEOF'
+          import json, subprocess, os
+          action, ports = os.environ['ACTION'], os.environ['PORTS']
+          want = set(int(p) for p in ports.replace(' ', '').split(',') if p)
+          cur = json.loads(subprocess.check_output([
+              'oci', 'network', 'security-list', 'get',
+              '--security-list-id', 'ocid1.securitylist.oc1.ap-singapore-1.aaaaaaaaozhglrhji2a4wcssgditmqp7jvhbjzcexrqhufp73td3z5rympmq',
+              '--output', 'json']))['data']
+          rules = cur['ingress-security-rules']
+          single_ports, keep = set(), []
+          for r in rules:
+              tcp = (r.get('tcp-options') or {}).get('destination-port-range') if r.get('protocol') == '6' else None
+              if tcp and tcp['min'] == tcp['max']:
+                  single_ports.add(tcp['min'])
+              else:
+                  keep.append(r)   # 非单端口规则原样保留
+          if action == 'open':
+              single_ports |= want
+          else:
+              single_ports -= want
+          new_rules = keep + [{
+              'source': '0.0.0.0/0', 'source-type': 'CIDR_BLOCK',
+              'protocol': '6', 'is-stateless': False,
+              'tcp-options': {'destination-port-range': {'min': p, 'max': p}, 'source-port-range': None},
+          } for p in sorted(single_ports)]
+          subprocess.run(['oci', 'network', 'security-list', 'update',
+                          '--security-list-id', 'ocid1.securitylist.oc1.ap-singapore-1.aaaaaaaaozhglrhji2a4wcssgditmqp7jvhbjzcexrqhufp73td3z5rympmq',
+                          '--ingress-security-rules', json.dumps(new_rules), '--force'], check=True)
+          print(f'[{action}] 目标端口 {sorted(want)} -> 现有单端口: {sorted(single_ports)}')
+          PYEOF
+      - name: Verify
+        run: |
+          oci network security-list get --security-list-id "ocid1.securitylist.oc1.ap-singapore-1.aaaaaaaaozhglrhji2a4wcssgditmqp7jvhbjzcexrqhufp73td3z5rympmq" \
+            --query 'data."ingress-security-rules"[].{proto:protocol,port:"tcp-options"."destination-port-range".min}' --output json
