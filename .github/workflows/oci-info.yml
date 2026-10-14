@@ -1,0 +1,50 @@
+name: OCI Info
+
+on:
+  workflow_dispatch:
+
+jobs:
+  info:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install OCI CLI
+        run: pip install oci-cli
+      - name: Write OCI config & key
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+        run: |
+          mkdir -p $HOME/.oci
+          printf '%s\n' "$OCI_KEY" > $HOME/oci_key.pem
+          chmod 600 $HOME/oci_key.pem
+          printf '%s\n' "$OCI_CONFIG" > $HOME/.oci/config
+      - name: Query tenancy / user / region
+        run: |
+          TENANCY=$(awk -F= '/^tenancy=/{print $2}' $HOME/.oci/config | tr -d ' ')
+          echo "===== TENANCY ====="
+          oci iam tenancy get --tenancy-id "$TENANCY" --query 'data.{name:name,id:id,home_region:"home-region-key"}' --output json
+          echo "===== USERS (登录名) ====="
+          oci iam user list --compartment-id "$TENANCY" --query 'data[].{name:name,email:email,state:"lifecycle-state"}' --output json
+          echo "===== REGIONS ====="
+          oci iam region-subscription list --tenancy-id "$TENANCY" --query 'data[].{"region-key":"region-key",status:status}' --output json
+      - name: Query network / public IPs / security lists
+        run: |
+          TENANCY=$(awk -F= '/^tenancy=/{print $2}' $HOME/.oci/config | tr -d ' ')
+          echo "===== PUBLIC IPs ====="
+          oci network public-ip list --compartment-id "$TENANCY" --scope REGION \
+            --query 'data[].{ip:"ip-address",lifetime:lifetime,state:"lifecycle-state",name:"display-name",assigned:"assigned-entity-id"}' --output json
+          echo "===== SUBNETS ====="
+          VCN=$(oci network vcn list --compartment-id "$TENANCY" --query 'data[0].id' --raw-output)
+          oci network subnet list --compartment-id "$TENANCY" --vcn-id "$VCN" --query 'data[].{name:"display-name",id:id}' --output json
+          echo "===== SECURITY LISTS ====="
+          oci network subnet list --compartment-id "$TENANCY" --vcn-id "$VCN" --query 'data[]."security-list-ids"[]' --raw-output | while read -r SL; do
+            [ -z "$SL" ] && continue
+            echo "--- SecurityList $SL ---"
+            oci network security-list get --security-list-id "$SL" \
+              --query 'data.{name:"display-name",ingress:"ingress-security-rules",egress:"egress-security-rules"}' --output json
+          done
