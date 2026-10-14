@@ -54,6 +54,7 @@ jobs:
           OLD_IP: ${{ inputs.old_ip }}
           RESERVED_NAME: ${{ inputs.reserved_name }}
         run: |
+          set -o pipefail
           python3 - <<'PYEOF' 2>&1 | tee /tmp/result.txt
           import json, os, sys, time, traceback
           import oci
@@ -80,6 +81,12 @@ jobs:
               except Exception as e:
                   return None, repr(e)
 
+          def sget(fn, *a, **kw):
+              r, e = safe(fn, *a, **kw)
+              if r is None:
+                  return None, e
+              return getattr(r, 'data', r), None
+
           def pub_by_addr(a):
               return net.get_public_ip_by_ip_address(
                   oci.core.models.GetPublicIpByIpAddressDetails(ip_address=a)).data
@@ -102,7 +109,7 @@ jobs:
                       print('  list_vnic_attachments err:', e)
                       continue
                   for a in atts:
-                      v, e1 = safe(net.get_vnic, a.vnic_id)
+                      v, e1 = sget(net.get_vnic, a.vnic_id)
                       if v is None:
                           print('  get_vnic err(%s): %s' % (a.vnic_id, e1))
                           continue
@@ -179,7 +186,7 @@ jobs:
                       print('assign attempt %d err: %s %s' % (att, e4.status, e4.message))
                   ok = False
                   for i in range(30):
-                      cur, e5 = safe(net.get_public_ip, new.id)
+                      cur, e5 = sget(net.get_public_ip, new.id)
                       if cur is None:
                           print('  poll err:', e5)
                           time.sleep(3)
