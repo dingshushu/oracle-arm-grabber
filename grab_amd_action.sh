@@ -44,11 +44,18 @@ except Exception:
     print(0)"
 }
 
-# 查询实例公网 IP（无存活实例时输出空）
+# 查询实例公网 IP（无存活实例/未分配时输出空）
+# 注意：Instance 对象没有 primary-public-ip 字段，必须走
+# vnic-attachment(拿 vnic-id) -> vnic get(拿 public-ip)，否则永远返回空。
 query_ip() {
-  oci compute instance list --compartment-id "$COMPARTMENT_ID" \
-    --display-name "$1" --query 'data[0]."primary-public-ip"' \
-    --raw-output 2>/dev/null
+  local name="$1" iid vnic
+  iid=$(oci compute instance list --compartment-id "$COMPARTMENT_ID" \
+        --display-name "$name" --query 'data[0].id' --raw-output 2>/dev/null)
+  [ -n "$iid" ] && [ "$iid" != "None" ] || return 0
+  vnic=$(oci compute vnic-attachment list --compartment-id "$COMPARTMENT_ID" \
+         --instance-id "$iid" --query 'data[0]."vnic-id"' --raw-output 2>/dev/null)
+  [ -n "$vnic" ] && [ "$vnic" != "None" ] || return 0
+  oci network vnic get --vnic-id "$vnic" --query 'data."public-ip"' --raw-output 2>/dev/null
 }
 
 # 动态发现最新的 Canonical Ubuntu x86_64 镜像（与 E2.1.Micro 兼容）
@@ -115,8 +122,13 @@ for n in $(seq 1 "$AMD_COUNT"); do
       continue
     elif echo "$RESULT" | grep -qi "provisioning"; then
       ID=$(echo "$RESULT" | grep -oP '"id":\s*"ocid1\.instance[^"]*"' | head -1 | grep -oP 'ocid1\.instance[^"]*')
-      sleep 10
-      IP=$(query_ip "$NAME")
+      # 公网 IP 分配需要时间，轮询等待（最多约 60s）
+      IP=""
+      for _w in 1 2 3 4 5 6; do
+        sleep 10
+        IP=$(query_ip "$NAME")
+        [ -n "$IP" ] && [ "$IP" != "None" ] && break
+      done
       echo "  [OK] $NAME 抢到！ID=$ID IP=${IP:-获取中}"
       NEW_LAUNCHED=$((NEW_LAUNCHED+1))
       break
@@ -131,6 +143,7 @@ done
 for n in 1 2; do
   NAME="amd"; [ "$n" -gt 1 ] && NAME="amd-$n"
   IP=$(query_ip "$NAME")
+  echo "  实例 $NAME 公网 IP: ${IP:-无}"
   if [ -n "$IP" ] && [ "$IP" != "None" ]; then
     if [ "$n" -eq 1 ]; then echo "amd_ip=$IP" >> "${GITHUB_OUTPUT:-/dev/null}"
     else echo "amd_ip_2=$IP" >> "${GITHUB_OUTPUT:-/dev/null}"; fi
