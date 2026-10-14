@@ -34,17 +34,23 @@ jobs:
           oci iam region-subscription list --tenancy-id "$TENANCY" --query 'data[].{"region-key":"region-key",status:status}' --output json
       - name: Query network / public IPs / security lists
         run: |
+          set +e
           TENANCY=$(awk -F= '/^tenancy=/{print $2}' $HOME/.oci/config | tr -d ' ')
-          echo "===== PUBLIC IPs ====="
-          oci network public-ip list --compartment-id "$TENANCY" --scope REGION \
-            --query 'data[].{ip:"ip-address",lifetime:lifetime,state:"lifecycle-state",name:"display-name",assigned:"assigned-entity-id"}' --output json
-          echo "===== SUBNETS ====="
-          VCN=$(oci network vcn list --compartment-id "$TENANCY" --query 'data[0].id' --raw-output)
-          oci network subnet list --compartment-id "$TENANCY" --vcn-id "$VCN" --query 'data[].{name:"display-name",id:id}' --output json
-          echo "===== SECURITY LISTS ====="
-          oci network subnet list --compartment-id "$TENANCY" --vcn-id "$VCN" --query 'data[]."security-list-ids"[]' --raw-output | while read -r SL; do
-            [ -z "$SL" ] && continue
-            echo "--- SecurityList $SL ---"
-            oci network security-list get --security-list-id "$SL" \
-              --query 'data.{name:"display-name",ingress:"ingress-security-rules",egress:"egress-security-rules"}' --output json
-          done
+          {
+            echo "===== PUBLIC IPs ====="
+            oci network public-ip list --compartment-id "$TENANCY" --scope REGION --all --output json
+            echo "===== VCNs ====="
+            VCN=$(oci network vcn list --compartment-id "$TENANCY" --query 'data[0].id' --raw-output 2>/dev/null)
+            echo "VCN=$VCN"
+            echo "===== SUBNETS ====="
+            oci network subnet list --compartment-id "$TENANCY" --vcn-id "$VCN" --output json
+            echo "===== SECURITY LISTS ====="
+            SLs=$(oci network subnet list --compartment-id "$TENANCY" --vcn-id "$VCN" --query 'data[]."security-list-ids"[]' --output json 2>/dev/null)
+            echo "$SLs" | python3 -c "import json,sys; [print(x) for x in json.load(sys.stdin)]" > /tmp/sls.txt
+            while read -r SL; do
+              [ -z "$SL" ] && continue
+              echo "--- SecurityList $SL ---"
+              oci network security-list get --security-list-id "$SL" --output json
+            done < /tmp/sls.txt
+          } > result.txt 2>&1
+          cat result.txt
