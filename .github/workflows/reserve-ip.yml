@@ -35,8 +35,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install OCI CLI
-        run: pip install oci-cli
+      - name: Install OCI SDK
+        run: pip install --quiet oci
 
       - name: Write OCI config & key
         env:
@@ -55,150 +55,147 @@ jobs:
           RESERVED_NAME: ${{ inputs.reserved_name }}
         run: |
           python3 - <<'PYEOF' 2>&1 | tee /tmp/result.txt
-          import json, os, subprocess, sys, time
+          import json, os, sys, time, traceback
+          import oci
 
           ACTION = os.environ.get('ACTION', '').strip()
           OLD_IP = os.environ.get('OLD_IP', '').strip()
-          R_NAME = os.environ.get('RESERVED_NAME', '').strip() or 'reserved-ip'
+          R_NAME = (os.environ.get('RESERVED_NAME', '').strip() or 'reserved-ip')
 
-          def run(args):
-              return subprocess.run(['oci'] + args + ['--output', 'json'], capture_output=True, text=True)
-
-          def try_call(args, default=None):
-              p = run(args)
-              if p.returncode != 0:
-                  return default
-              try:
-                  return json.loads(p.stdout)['data']
-              except Exception:
-                  return default
-
-          cfg_lines = open(os.path.expanduser('~/.oci/config')).read().splitlines()
-          tenancy = None
-          for ln in cfg_lines:
-              s = ln.strip()
-              if s.startswith('tenancy='):
-                  tenancy = s.split('=', 1)[1].strip()
+          cfg = oci.config.from_file()
+          net = oci.core.VirtualNetworkClient(cfg)
+          comp = oci.core.ComputeClient(cfg)
+          tenancy = cfg['tenancy']
           print('TENANCY:', tenancy)
           print('ACTION=%s OLD_IP=%s NAME=%s' % (ACTION, OLD_IP or '-', R_NAME))
 
-          comps = try_call(['iam', 'compartment', 'list', '--compartment-id', tenancy,
-                            '--compartment-id-in-subtree', 'true', '--access-level', 'ACCESSIBLE', '--all'], []) or []
-          comp_ids = [tenancy] + [c['id'] for c in comps]
-          cname = {tenancy: '(root)'}
-          for c in comps:
-              cname[c['id']] = c['name']
-          print('COMPARTMENTS:', len(comp_ids))
+          def all_pages(fn, **kw):
+              return oci.pagination.list_call_get_all_results(fn, **kw).data
 
-          pub_by_priv = {}
-          pub_all = []
-          for cid in comp_ids:
-              lst = try_call(['network', 'public-ip', 'list', '--scope', 'REGION', '--compartment-id', cid, '--all'], []) or []
-              for pub in lst:
-                  pub['_comp'] = cid
-                  pub_all.append(pub)
-                  pid = pub.get('private-ip-id')
-                  if pid:
-                      pub_by_priv.setdefault(pid, []).append(pub)
-          print('PUBLIC_IPS_VISIBLE:', len(pub_all))
+          def safe(fn, *a, **kw):
+              try:
+                  return fn(*a, **kw), None
+              except oci.exceptions.ServiceError as e:
+                  return None, 'ServiceError %s %s' % (e.status, e.message)
+              except Exception as e:
+                  return None, repr(e)
+
+          def pub_by_addr(a):
+              return net.get_public_ip_by_ip_address(
+                  oci.core.models.GetPublicIpByIpAddressDetails(ip_address=a)).data
+
+          def pub_by_priv(pid):
+              return net.get_public_ip_by_private_ip_id(
+                  oci.core.models.GetPublicIpByPrivateIpIdDetails(private_ip_id=pid)).data
+
+          def fmt(pb):
+              return '%s lifetime=%s state=%s id=%s priv=%s' % (
+                  pb.ip_address, pb.lifetime, pb.lifecycle_state, pb.id, pb.private_ip_id)
 
           if ACTION == 'plan':
-              insts = []
-              for cid in comp_ids:
-                  lst = try_call(['compute', 'instance', 'list', '--compartment-id', cid, '--all'], []) or []
-                  for i in lst:
-                      insts.append((cid, i))
+              insts = all_pages(comp.list_instances, compartment_id=tenancy)
               print('INSTANCES:', len(insts))
-              report = []
-              for cid, inst in insts:
-                  rec = {'name': inst.get('display-name'), 'ocid': inst['id'],
-                         'state': inst['lifecycle-state'], 'compartment': cname.get(cid, cid)}
-                  vnics = try_call(['compute', 'instance', 'list-vnics', '--instance-id', inst['id']], []) or []
-                  pubs = []
+              for inst in insts:
+                  print('--- %s | %s | %s' % (inst.display_name, inst.lifecycle_state, inst.id))
+                  vnics, e = safe(all_pages, comp.list_vnics, instance_id=inst.id)
+                  if vnics is None:
+                      print('  list_vnics err:', e)
+                      continue
                   for v in vnics:
-                      pips = try_call(['network', 'private-ip', 'list', '--vnic-id', v['id']], []) or []
+                      print('  VNIC %s primary=%s' % (v.id, v.is_primary))
+                      pips, e2 = safe(all_pages, net.list_private_ips, vnic_id=v.id)
+                      if pips is None:
+                          print('   list_private_ips err:', e2)
+                          continue
                       for p in pips:
-                          if not p.get('is-primary'):
-                              continue
-                          found = pub_by_priv.get(p['id'])
-                          if not found:
-                              g = try_call(['network', 'public-ip', 'get-public-ip-by-private-ip-id', '--private-ip-id', p['id']])
-                              if g:
-                                  found = [g]
-                          for pub in (found or []):
-                              pubs.append({'ip': pub.get('ip-address'), 'lifetime': pub.get('lifetime'),
-                                           'state': pub.get('lifecycle-state'), 'public_ip_ocid': pub.get('id'),
-                                           'private_ip_ocid': p['id'], 'vnic_ocid': v['id']})
-                  rec['public_ips'] = pubs
-                  report.append(rec)
-              resv = [p for p in pub_all if p.get('lifetime') == 'RESERVED']
-              print('RESERVED_IPS_COUNT:', len(resv))
-              for p in resv:
-                  print('  reserved:', p.get('ip-address'), p.get('lifecycle-state'), p.get('display-name'))
-              print('REPORT_JSON_BEGIN')
-              print(json.dumps(report, indent=1))
-              print('REPORT_JSON_END')
+                          print('   priv %s primary=%s ip=%s' % (p.id, p.is_primary, p.ip_address))
+                          if p.is_primary:
+                              pb, e3 = safe(pub_by_priv, p.id)
+                              print('    pub-by-priv ->', fmt(pb) if pb else e3)
+              for ip in ('168.107.86.163', '161.118.248.18'):
+                  pb, e4 = safe(pub_by_addr, ip)
+                  print('LOOKUP %s ->' % ip, fmt(pb) if pb else e4)
 
           if ACTION == 'apply':
               if not OLD_IP:
-                  print('ERROR: old_ip is required')
+                  print('ERROR: old_ip required')
                   sys.exit(1)
-              target = None
-              for pub in pub_all:
-                  if pub.get('ip-address') == OLD_IP:
-                      target = pub
+              pb, e = safe(pub_by_addr, OLD_IP)
+              if pb is None:
+                  print('ERROR: lookup failed:', e)
+                  sys.exit(1)
+              print('TARGET:', fmt(pb))
+              if pb.lifetime != 'EPHEMERAL':
+                  print('ABORT: target lifetime is %s, not EPHEMERAL' % pb.lifetime)
+                  sys.exit(1)
+              if not pb.private_ip_id:
+                  print('ABORT: no private ip on target')
+                  sys.exit(1)
+              priv_id = pb.private_ip_id
+              comp_id = pb.compartment_id
+              old_id = pb.id
+              new = None
+              for att in range(1, 4):
+                  try:
+                      new = net.create_public_ip(oci.core.models.CreatePublicIpDetails(
+                          compartment_id=comp_id, lifetime='RESERVED',
+                          display_name=R_NAME)).data
                       break
-              if not target:
-                  g = try_call(['network', 'public-ip', 'get-public-ip-by-ip-address', '--ip-address', OLD_IP, '--scope', 'REGION'])
-                  if g:
-                      target = g
-              if not target:
-                  print('ERROR: public IP %s not found' % OLD_IP)
+                  except oci.exceptions.ServiceError as e2:
+                      print('create attempt %d err: %s %s' % (att, e2.status, e2.message))
+                      time.sleep(5)
+              if new is None:
+                  print('ERROR: reserved ip create failed')
                   sys.exit(1)
-              print('FOUND:', json.dumps({k: target.get(k) for k in ('id', 'ip-address', 'lifetime', 'lifecycle-state', 'private-ip-id', 'display-name')}, indent=1))
-              lt = target.get('lifetime')
-              if lt != 'EPHEMERAL':
-                  print('ABORT: target lifetime is %s, not EPHEMERAL' % lt)
-                  sys.exit(1)
-              pub_id = target['id']
-              priv_id = target['private-ip-id']
-              comp_id = target.get('_comp') or target.get('compartment-id')
-              existing = [p for p in pub_by_priv.get(priv_id, []) if p.get('lifetime') == 'RESERVED']
-              if existing:
-                  print('NOTE: reserved ip already assigned:', existing[0].get('ip-address'))
-              p = run(['network', 'public-ip', 'delete', '--public-ip-id', pub_id, '--force',
-                       '--wait-for-state', 'TERMINATED', '--max-wait-seconds', '240'])
-              print('DELETE rc=%s' % p.returncode)
-              print((p.stdout or '')[-1500:])
-              print((p.stderr or '')[-1500:])
-              if p.returncode != 0:
-                  print('ERROR: delete failed')
-                  sys.exit(1)
-              print('STEP: ephemeral %s deleted' % OLD_IP)
-              newpub = None
-              for attempt in range(1, 4):
-                  p = run(['network', 'public-ip', 'create', '--compartment-id', comp_id, '--lifetime', 'RESERVED',
-                           '--display-name', R_NAME, '--private-ip-id', priv_id,
-                           '--wait-for-state', 'ASSIGNED', '--max-wait-seconds', '300'])
-                  if p.returncode == 0:
-                      newpub = json.loads(p.stdout)['data']
+              print('PRE-CREATED reserved:', new.ip_address, new.id, new.lifecycle_state)
+              print('STEP: deleting ephemeral %s (id=%s)' % (OLD_IP, old_id))
+              d, ed = safe(net.delete_public_ip, old_id)
+              if ed:
+                  print('  delete note:', ed)
+              freed = False
+              for i in range(40):
+                  p2, err2 = safe(pub_by_priv, priv_id)
+                  if p2 is None:
+                      freed = True
+                      print('STEP: private ip freed (no public ip)')
                       break
-                  print('CREATE attempt %d failed:' % attempt)
-                  print((p.stdout or '')[-1200:])
-                  print((p.stderr or '')[-1200:])
-                  time.sleep(8)
-                  chk = try_call(['network', 'public-ip', 'get-public-ip-by-private-ip-id', '--private-ip-id', priv_id])
-                  if chk and chk.get('lifetime') == 'RESERVED':
-                      newpub = chk
-                      print('note: assignment found via re-check')
+                  st = getattr(p2, 'lifecycle_state', '?')
+                  print('  wait free: %s' % st)
+                  if st in ('TERMINATED', 'TERMINATING'):
+                      time.sleep(3)
+                      continue
+                  time.sleep(3)
+              if not freed:
+                  print('WARN: private ip not confirmed free, assigning anyway')
+              assigned = None
+              for att in range(1, 6):
+                  try:
+                      net.update_public_ip(new.id, oci.core.models.UpdatePublicIpDetails(private_ip_id=priv_id))
+                  except oci.exceptions.ServiceError as e4:
+                      print('assign attempt %d err: %s %s' % (att, e4.status, e4.message))
+                  ok = False
+                  for i in range(30):
+                      cur, e5 = safe(net.get_public_ip, new.id)
+                      if cur is None:
+                          print('  poll err:', e5)
+                          time.sleep(3)
+                          continue
+                      print('  poll state: %s priv=%s' % (cur.lifecycle_state, cur.private_ip_id))
+                      if cur.lifecycle_state == 'ASSIGNED' and cur.private_ip_id == priv_id:
+                          assigned = cur
+                          ok = True
+                          break
+                      time.sleep(3)
+                  if ok:
                       break
-              if not newpub:
-                  print('ERROR: reserved ip creation failed after retries')
+                  time.sleep(5)
+              if assigned is None:
+                  print('ERROR: assignment did not reach ASSIGNED')
                   sys.exit(1)
-              print('NEW_IP: %s' % newpub.get('ip-address'))
-              print('NEW_PUBLIC_IP_OCID: %s' % newpub.get('id'))
-              print('NEW_STATE: %s lifetime=%s' % (newpub.get('lifecycle-state'), newpub.get('lifetime')))
-              print('RESULT: converted %s -> %s' % (OLD_IP, newpub.get('ip-address')))
+              print('NEW_IP: %s' % assigned.ip_address)
+              print('NEW_PUBLIC_IP_OCID: %s' % assigned.id)
+              print('NEW_STATE: %s lifetime=%s' % (assigned.lifecycle_state, assigned.lifetime))
+              print('RESULT: converted %s -> %s' % (OLD_IP, assigned.ip_address))
           PYEOF
 
       - name: Publish result
