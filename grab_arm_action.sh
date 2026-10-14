@@ -44,6 +44,20 @@ send_notify() {
   fi
 }
 
+# 查询实例公网 IP（无实例/未分配时输出空）
+# 注意：Instance 对象没有 primary-public-ip 字段，必须走
+# vnic-attachment(拿 vnic-id) -> vnic get(拿 public-ip)，否则永远返回空。
+query_ip() {
+  local iid vnic
+  iid=$(oci --no-retry compute instance list --compartment-id "$COMPARTMENT_ID" \
+        --display-name "$DISPLAY_NAME" --query 'data[0].id' --raw-output 2>/dev/null)
+  [ -n "$iid" ] && [ "$iid" != "None" ] || return 0
+  vnic=$(oci --no-retry compute vnic-attachment list --compartment-id "$COMPARTMENT_ID" \
+         --instance-id "$iid" --query 'data[0]."vnic-id"' --raw-output 2>/dev/null)
+  [ -n "$vnic" ] && [ "$vnic" != "None" ] || return 0
+  oci --no-retry network vnic get --vnic-id "$vnic" --query 'data."public-ip"' --raw-output 2>/dev/null
+}
+
 echo "== 预检：是否已有运行中的实例 =="
 EXISTING=$(oci --no-retry compute instance list \
   --compartment-id "$COMPARTMENT_ID" \
@@ -218,11 +232,14 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
     continue
   elif echo "$RESULT" | grep -qi "provisioning"; then
     ID=$(echo "$RESULT" | grep -oP '"id":\s*"ocid1\.instance[^"]*"' | head -1 | grep -oP 'ocid1\.instance[^"]*')
-    sleep 10
-    IP=$(oci --no-retry compute instance list --compartment-id "$COMPARTMENT_ID" \
-      --display-name "$DISPLAY_NAME" --query 'data[0]."primary-public-ip"' \
-      --raw-output 2>/dev/null)
-    echo "  [OK] 抢到了！ID=$ID IP=$IP"
+    # 公网 IP 分配需要时间，轮询等待（最多约 60s）
+    IP=""
+    for _w in 1 2 3 4 5 6; do
+      sleep 10
+      IP=$(query_ip)
+      [ -n "$IP" ] && [ "$IP" != "None" ] && break
+    done
+    echo "  [OK] 抢到了！ID=$ID IP=${IP:-获取中}"
     echo "arm_ip=$IP" >> "${GITHUB_OUTPUT:-/dev/null}"
     send_notify "[OK] ARM抢机成功" "区域: $TARGET_AD\n配置: $OCPUS OCPU/$MEMORY GB\nIP: ${IP:-查看控制台}\n登录: ssh -i oracle_arm_id_rsa ubuntu@${IP:-IP}"
     exit 0
