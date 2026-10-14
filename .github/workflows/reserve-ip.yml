@@ -97,12 +97,16 @@ jobs:
               print('INSTANCES:', len(insts))
               for inst in insts:
                   print('--- %s | %s | %s' % (inst.display_name, inst.lifecycle_state, inst.id))
-                  vnics, e = safe(all_pages, comp.list_vnics, instance_id=inst.id)
-                  if vnics is None:
-                      print('  list_vnics err:', e)
+                  atts, e = safe(all_pages, comp.list_vnic_attachments, compartment_id=tenancy, instance_id=inst.id)
+                  if atts is None:
+                      print('  list_vnic_attachments err:', e)
                       continue
-                  for v in vnics:
-                      print('  VNIC %s primary=%s' % (v.id, v.is_primary))
+                  for a in atts:
+                      v, e1 = safe(net.get_vnic, a.vnic_id)
+                      if v is None:
+                          print('  get_vnic err(%s): %s' % (a.vnic_id, e1))
+                          continue
+                      print('  VNIC %s (nic_index=%s)' % (v.id, getattr(a, 'nic_index', '?')))
                       pips, e2 = safe(all_pages, net.list_private_ips, vnic_id=v.id)
                       if pips is None:
                           print('   list_private_ips err:', e2)
