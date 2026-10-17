@@ -61,10 +61,6 @@ jobs:
         run: |
           set +e
           python3 - <<'PY'
-          import oci, config as _  # noqa
-          PY
-          2>/dev/null || true
-          python3 - <<'PY'
           import oci, os
           cfg = oci.config.from_file(os.path.expanduser("~/.oci/config"))
           comp = cfg["tenancy"]
@@ -80,7 +76,7 @@ jobs:
           for i in rows:
               print(f"--- {i.display_name} | {i.shape} | {i.lifecycle_state} | created={i.time_created} | id={i.id[-12:]}")
               try:
-                  vnics = ce.list_vnic_attachments(i.id, compartment_id=comp).data
+                  vnics = ce.list_vnic_attachments(comp, i.id).data
                   for va in vnics:
                       v = net.get_vnic(va.vnic_id).data
                       print(f"      vnic: private={v.private_ip} public={v.public_ip}")
