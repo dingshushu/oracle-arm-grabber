@@ -1,10 +1,13 @@
 name: Grab Oracle ARM
 
-# 每 5 分钟一波密集尝试（一轮内连试多次，自适应调速）。
-# 比 a1-hunter 的"本地秒级常驻"少了连续轮询，但零维护、关机照跑。
+# 策略（2026-10-17 起）：每 15 分钟一轮，但单轮跑得更久、探测更密。
+# 依据：A1 放货窗口常是几十秒~几分钟的瞬时窗口；原先"每 5 分钟 × 6 次"在持续限流下
+# 每轮只跑 112s 就因连续 3 次限流提前收工，对瞬时窗口几乎无覆盖能力。
+# 现在 = 低频触发（降风控压力）+ 单轮深探测（MAX_ATTEMPTS 10 / TIME_BUDGET 320s /
+# 限流容忍 6 次），job 超时同步放宽到 9 分钟。
 on:
   schedule:
-    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'   # 每 5 分钟（偏移避开整点；新 workflow ID 重新登记）
+    - cron: '4,19,34,49 * * * *'   # 每 15 分钟（偏移避开整点；避开 :00/:30 的高峰）
   workflow_dispatch:         # 允许手动点一下立即运行（测试用）
     inputs:
       strict_skip:
@@ -21,7 +24,7 @@ concurrency:
 jobs:
   grab:
     runs-on: ubuntu-24.04   # 固定 LTS，避免 ubuntu-latest 于 2026-10-19 迁移 Ubuntu 26 引发意外
-    timeout-minutes: 6
+    timeout-minutes: 9      # 单轮最长约 320s + setup ~90s，留足余量（原 6 分钟会截断深探测轮次）
     permissions:
       issues: write
     env:
@@ -59,7 +62,9 @@ jobs:
           SSH_KEY_PUB: ${{ secrets.SSH_KEY_PUB }}
           ADAPTIVE: "true"            # 自适应调速：被限速自动退避
           CAPACITY_PRECHECK: "true"   # 容量预检：每轮先查 Capacity Report
-          MAX_ATTEMPTS: "6"           # 单轮尝试次数（预检有货时自动加量到 11）
+          MAX_ATTEMPTS: "10"          # 单轮尝试次数（预检有货时自动加量到 15）
+          TIME_BUDGET: "320"          # 单轮时间预算(秒)：15 分钟间隔下可放心跑更久
+          MAX_THROTTLE_STREAK: "6"    # 限流容忍：原 3 次太早收工（实测每轮必撞 3 次），放宽到 6
           STRICT_SKIP: ${{ github.event.inputs.strict_skip || 'false' }}   # 默认不跳过（防误杀）；手动可勾选严格模式
         run: bash grab_arm_action.sh
 
