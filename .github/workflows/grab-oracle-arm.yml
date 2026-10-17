@@ -1,13 +1,12 @@
 name: Grab Oracle ARM
 
-# 策略（2026-10-17 起）：每 15 分钟一轮，但单轮跑得更久、探测更密。
-# 依据：A1 放货窗口常是几十秒~几分钟的瞬时窗口；原先"每 5 分钟 × 6 次"在持续限流下
-# 每轮只跑 112s 就因连续 3 次限流提前收工，对瞬时窗口几乎无覆盖能力。
-# 现在 = 低频触发（降风控压力）+ 单轮深探测（MAX_ATTEMPTS 10 / TIME_BUDGET 320s /
-# 限流容忍 6 次），job 超时同步放宽到 9 分钟。
+# 策略（2026-10-17 深夜起）：每 8 分钟一轮、单轮深探测 400s。
+# 依据：A1 放货窗口常是几十秒~几分钟的瞬时窗口；仓库 public（Actions 分钟无限），
+# 提频的成本只是运行记录变多。8 分钟 × 400s 探测 ≈ 全天 83% 时间覆盖率。
+# 脚本侧同步：限流前 2 次 5s 快速重试（探测密度 4→10 次/轮）+ 连续 24 轮无货降 1 OCPU 捡漏。
 on:
   schedule:
-    - cron: '4,19,34,49 * * * *'   # 每 15 分钟（偏移避开整点；避开 :00/:30 的高峰）
+    - cron: '*/8 * * * *'          # 每 8 分钟；与 cron-job.org job 8620957 的 [0,8,16,...,56] 对齐
   workflow_dispatch:         # 允许手动点一下立即运行（测试用）
     inputs:
       strict_skip:
@@ -34,10 +33,11 @@ jobs:
       AVAILABILITY_DOMAIN: "bThc:AP-SINGAPORE-1-AD-1"
       SUBNET_ID: "ocid1.subnet.oc1.ap-singapore-1.aaaaaaaa2dnalbqseumn75ga3klzgpgbyk7jgh6r6riidtehul22yhauxtna"
       IMAGE_ID: "ocid1.image.oc1.ap-singapore-1.aaaaaaaaw75ef2chh5goomskvdznqz36cadczqelqvndbqcozc5icyig57za"
-      # 节流阈值(秒)：实际触发源 cron-job.org 固定每 5 分钟打一次 workflow_dispatch，
-      # 无法从 GitHub 侧改它的间隔，故在此做门控 —— 距上次放行不足该值就直接退出。
-      # 840s = 14 分钟，配合 5 分钟节奏自然收敛为「每 15 分钟真正跑一轮」。
-      MIN_GAP_SECONDS: "840"
+      # 节流阈值(秒)：两个触发源（GitHub cron */8 + cron-job.org job 8620957
+      # 的 [0,8,16,...,56] UTC）每分钟对齐点火，靠此门控去重——距上次任何触发
+      # 放行不足该值就直接退出。470s ≈ 8 分钟（留 10s 容忍 cron 漂移，
+      # 旧值 840s 是 5 分钟时代的产物，会让双源同分钟各跑一轮）。
+      MIN_GAP_SECONDS: "470"
     steps:
       - name: Throttle gate（节流闸门）
         id: gate
@@ -47,7 +47,10 @@ jobs:
           set -u
           REPO="${{ github.repository }}"
           now=$(date +%s)
-          # 取本 workflow 最近一次成功进入执行体的运行（排除当前这次与排队中的）
+          # 取本 workflow 最近一次运行（排除当前这次）。
+          # 注意：必须统计所有触发事件（schedule + workflow_dispatch）——
+          # 旧版只统计 workflow_dispatch，GitHub cron 与 cron-job.org 同分钟
+          # 各跑一轮时门控失效（schedule 的 run 不计入窗口）。
           api="https://api.github.com/repos/${REPO}/actions/workflows/grab-oracle-arm.yml/runs?per_page=15"
           last=$(curl -sS -m 20 -H "Authorization: Bearer ${GH_TOKEN}" \
                  -H "Accept: application/vnd.github+json" "$api" \
@@ -55,13 +58,12 @@ jobs:
                    --argjson cur "${{ github.run_id }}" '
                      [ .workflow_runs[]
                        | select(.id != $cur)
-                       | select(.event == "workflow_dispatch")
-                       | select(.status == "completed" or .status == "in_progress")
+                       | select(.status == "completed" or .status == "in_progress" or .status == "queued")
                      ]
                      | map(select((($now - (.created_at|fromdateiso8601)) < $gap)))
                      | length' 2>/dev/null || echo 0)
           if [ "${last:-0}" -gt 0 ]; then
-            echo "距上次运行不足 ${MIN_GAP_SECONDS}s，本轮跳过（等效 15 分钟节奏）。"
+            echo "距上次运行不足 ${MIN_GAP_SECONDS}s，本轮跳过（等效 8 分钟节奏）。"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "距上次运行已超过 ${MIN_GAP_SECONDS}s，本轮正常执行。"
@@ -99,11 +101,13 @@ jobs:
         env:
           SCT_KEY: ${{ secrets.SCT_KEY }}
           SSH_KEY_PUB: ${{ secrets.SSH_KEY_PUB }}
+          GH_TOKEN: ${{ github.token }}        # 阶梯 OCPU 状态机需读写本仓库 issue
           ADAPTIVE: "true"            # 自适应调速：被限速自动退避
           CAPACITY_PRECHECK: "true"   # 容量预检：每轮先查 Capacity Report
           MAX_ATTEMPTS: "10"          # 单轮尝试次数（预检有货时自动加量到 15）
-          TIME_BUDGET: "320"          # 单轮时间预算(秒)：15 分钟间隔下可放心跑更久
-          MAX_THROTTLE_STREAK: "6"    # 限流容忍：原 3 次太早收工（实测每轮必撞 3 次），放宽到 6
+          TIME_BUDGET: "400"          # 单轮时间预算(秒)：8 分钟节奏 + 9 分钟 job 超时内跑满
+          MAX_THROTTLE_STREAK: "6"    # 限流容忍：连续 6 次才收工（前 2 次已改快速重试）
+          STEP_OCPU_ENABLED: "true"   # 阶梯策略：连续 24 轮无货降 1 OCPU 捡漏，中奖即扩容回 2
           STRICT_SKIP: ${{ github.event.inputs.strict_skip || 'false' }}   # 默认不跳过（防误杀）；手动可勾选严格模式
         run: bash grab_arm_action.sh
 
