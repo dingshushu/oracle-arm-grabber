@@ -56,3 +56,34 @@ jobs:
             done < /tmp/sls.txt
           } > result.txt 2>&1
           cat result.txt
+
+      - name: Query instances (inventory, 2026-10-17 加)
+        run: |
+          set +e
+          python3 - <<'PY'
+          import oci, config as _  # noqa
+          PY
+          2>/dev/null || true
+          python3 - <<'PY'
+          import oci, os
+          cfg = oci.config.from_file(os.path.expanduser("~/.oci/config"))
+          comp = cfg["tenancy"]
+          comp_client = oci.identity.IdentityClient(cfg)
+          print("===== COMPARTMENT IDS =====")
+          for c in comp_client.list_compartments(comp).data:
+              print(c.id, c.name, c.lifecycle_state)
+          print("===== INSTANCES (all shapes/states) =====")
+          ce = oci.core.ComputeClient(cfg)
+          net = oci.core.VirtualNetworkClient(cfg)
+          rows = ce.list_instances(comp).data
+          print(f"total instances: {len(rows)}")
+          for i in rows:
+              print(f"--- {i.display_name} | {i.shape} | {i.lifecycle_state} | created={i.time_created} | id={i.id[-12:]}")
+              try:
+                  vnics = ce.list_vnic_attachments(i.id, compartment_id=comp).data
+                  for va in vnics:
+                      v = net.get_vnic(va.vnic_id).data
+                      print(f"      vnic: private={v.private_ip} public={v.public_ip}")
+              except Exception as e:
+                  print("      vnic query failed:", e)
+          PY
