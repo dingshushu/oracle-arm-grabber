@@ -76,7 +76,7 @@ jobs:
           for i in rows:
               print(f"--- {i.display_name} | {i.shape} | {i.lifecycle_state} | created={i.time_created} | id={i.id[-12:]}")
               try:
-                  vnics = ce.list_vnic_attachments(comp, i.id).data
+                  vnics = ce.list_vnic_attachments(compartment_id=comp, instance_id=i.id).data
                   for va in vnics:
                       v = net.get_vnic(va.vnic_id).data
                       print(f"      vnic: private={v.private_ip} public={v.public_ip}")
