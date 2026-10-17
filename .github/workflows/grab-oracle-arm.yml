@@ -27,25 +27,63 @@ jobs:
     timeout-minutes: 9      # 单轮最长约 320s + setup ~90s，留足余量（原 6 分钟会截断深探测轮次）
     permissions:
       issues: write
+      actions: read          # 节流闸门需查询本 workflow 的历史运行
     env:
       # 以下为非敏感固定参数（主区域 ap-singapore-1）
       COMPARTMENT_ID: "ocid1.tenancy.oc1..aaaaaaaaii4jwevwldqla6tyb2wy3avachyzlhuoizmvg4wrjczdpfe5aznq"
       AVAILABILITY_DOMAIN: "bThc:AP-SINGAPORE-1-AD-1"
       SUBNET_ID: "ocid1.subnet.oc1.ap-singapore-1.aaaaaaaa2dnalbqseumn75ga3klzgpgbyk7jgh6r6riidtehul22yhauxtna"
       IMAGE_ID: "ocid1.image.oc1.ap-singapore-1.aaaaaaaaw75ef2chh5goomskvdznqz36cadczqelqvndbqcozc5icyig57za"
+      # 节流阈值(秒)：实际触发源 cron-job.org 固定每 5 分钟打一次 workflow_dispatch，
+      # 无法从 GitHub 侧改它的间隔，故在此做门控 —— 距上次放行不足该值就直接退出。
+      # 840s = 14 分钟，配合 5 分钟节奏自然收敛为「每 15 分钟真正跑一轮」。
+      MIN_GAP_SECONDS: "840"
     steps:
+      - name: Throttle gate（节流闸门）
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          REPO="${{ github.repository }}"
+          now=$(date +%s)
+          # 取本 workflow 最近一次成功进入执行体的运行（排除当前这次与排队中的）
+          api="https://api.github.com/repos/${REPO}/actions/workflows/grab-oracle-arm.yml/runs?per_page=15"
+          last=$(curl -sS -m 20 -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/vnd.github+json" "$api" \
+                 | jq -r --argjson now "$now" --argjson gap "$MIN_GAP_SECONDS" \
+                   --argjson cur "${{ github.run_id }}" '
+                     [ .workflow_runs[]
+                       | select(.id != $cur)
+                       | select(.event == "workflow_dispatch")
+                       | select(.status == "completed" or .status == "in_progress")
+                     ]
+                     | map(select((($now - (.created_at|fromdateiso8601)) < $gap)))
+                     | length' 2>/dev/null || echo 0)
+          if [ "${last:-0}" -gt 0 ]; then
+            echo "距上次运行不足 ${MIN_GAP_SECONDS}s，本轮跳过（等效 15 分钟节奏）。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "距上次运行已超过 ${MIN_GAP_SECONDS}s，本轮正常执行。"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout
+        if: steps.gate.outputs.skip != 'true'
         uses: actions/checkout@v7
 
       - name: Setup Python
+        if: steps.gate.outputs.skip != 'true'
         uses: actions/setup-python@v7
         with:
           python-version: '3.11'
 
       - name: Install OCI CLI (含 oci Python SDK，供容量预检使用)
+        if: steps.gate.outputs.skip != 'true'
         run: pip install oci-cli
 
       - name: Write OCI config & key
+        if: steps.gate.outputs.skip != 'true'
         env:
           OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
           OCI_KEY: ${{ secrets.OCI_KEY }}
@@ -56,6 +94,7 @@ jobs:
           printf '%s\n' "$OCI_CONFIG" > $HOME/.oci/config
 
       - name: Run grabber
+        if: steps.gate.outputs.skip != 'true'
         id: grab
         env:
           SCT_KEY: ${{ secrets.SCT_KEY }}
