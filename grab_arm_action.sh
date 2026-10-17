@@ -10,6 +10,13 @@
 #      默认关闭严格跳过（只记录日志），避免误杀真实可用窗口。
 #   3) 全 AD 扫描 + 跨 AD 切换（MULTI_AD）：动态列出 tenancy 下所有 AD 并逐个探测容量，
 #      主 AD 无货但备用 AD 有货时，自动切换到有货 AD（需该 AD 有可用子网）。
+#   1c) 限流退避精细化（2026-10-17 深夜）：连续第 1/2 次被 429 限流只等 5s 快速重试
+#       （OCI 限流窗口常按分钟重置，短重试常能溜过去），连续第 3 次起才 +30s 长退避。
+#       实测旧逻辑"一被限流就 +30s"把每轮真实探测从 10 次压到 4 次，本优化直接翻倍探测密度。
+#   4) 阶梯 OCPU（2026-10-17 深夜）：连续 STEP_ROUNDS 轮无货后，本轮自动降规格
+#      (1 OCPU/6GB) 捡碎片容量——A1.Flex 容量按请求的 shape config 算，宿主只剩 1 核
+#      闲置时 2 核请求必败、1 核能中；抢到后立即 update shape 扩回 2 OCPU/12GB（免费额度内）。
+#      "连续无货轮数"状态存于本仓库固定 issue（Actions runner 每次全新，无本地状态）。
 set -u
 
 export SUPPRESS_LABEL_WARNING=True
@@ -22,16 +29,21 @@ MEMORY=12
 BOOT_SIZE=100
 
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-10}"   # 单轮尝试次数上限（硬顶）
-TIME_BUDGET="${TIME_BUDGET:-210}"    # 单轮时间预算(秒)：到点自动收工，保证跑进 5 分钟调度间隔
-MAX_THROTTLE_STREAK="${MAX_THROTTLE_STREAK:-3}"  # 连续被限流上限：超过说明 OCI 在压速率，提前收工
+TIME_BUDGET="${TIME_BUDGET:-400}"    # 单轮时间预算(秒)：8 分钟触发节奏 + 9 分钟 job 超时
+MAX_THROTTLE_STREAK="${MAX_THROTTLE_STREAK:-6}"  # 连续被限流上限：超过说明 OCI 在压速率，提前收工
 INTERVAL=8                          # 当前尝试间隔（秒），自适应调整
 MIN_INTERVAL=5
 MAX_INTERVAL=120                    # 退避上限
+FAST_RETRY_UNTIL=3                  # 连续限流 <3 次：只等 MIN_INTERVAL 快速重试；>=3 才长退避
 
 ADAPTIVE="${ADAPTIVE:-true}"            # 自适应调速开关
 CAPACITY_PRECHECK="${CAPACITY_PRECHECK:-true}"  # 容量预检开关
 STRICT_SKIP="${STRICT_SKIP:-false}"     # 仅在明确无容量时跳过（默认关，避免误杀）
 MULTI_AD="${MULTI_AD:-true}"            # 全 AD 扫描 + 跨 AD 切换开关
+STEP_OCPU_ENABLED="${STEP_OCPU_ENABLED:-true}"  # 阶梯 OCPU 总开关
+STEP_OCPUS="${STEP_OCPUS:-1}"           # 降规格档位
+STEP_MEMORY="${STEP_MEMORY:-6}"
+STEP_ROUNDS="${STEP_ROUNDS:-24}"        # 连续多少轮无货后启用降规格（24 轮≈8 分钟节奏下 3.2 小时）
 
 SSH_FILE=$HOME/id_rsa.pub
 printf '%s\n' "${SSH_KEY_PUB:-}" > "$SSH_FILE"
@@ -58,6 +70,36 @@ query_ip() {
   oci --no-retry network vnic get --vnic-id "$vnic" --query 'data."public-ip"' --raw-output 2>/dev/null
 }
 
+# ===== 阶梯 OCPU 状态机 =====
+# "连续无货轮数"存在仓库固定 issue 的 body（round_no=N）。
+# Actions runner 每次都是全新容器，无本地状态可留；gh CLI Actions 环境自带，
+# 手动/本地环境没有 gh 或 GITHUB_REPOSITORY 时静默降级为 0（不影响主流程）。
+STATE_TITLE="ARM 抢机状态机（自动维护，勿删）"
+read_round_no() {
+  [ -n "${GITHUB_REPOSITORY:-}" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local num body
+  num=$(gh api "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" \
+        | jq -r --arg t "$STATE_TITLE" 'map(select(.title==$t)) | .[0].number // empty' 2>/dev/null)
+  [ -n "$num" ] || return 0
+  body=$(gh api "repos/$GITHUB_REPOSITORY/issues/$num" | jq -r '.body // ""' 2>/dev/null)
+  echo "$body" | grep -oE 'round_no=[0-9]+' | head -1 | cut -d= -f2
+}
+write_round_no() {
+  [ -n "${GITHUB_REPOSITORY:-}" ] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local num
+  num=$(gh api "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" \
+        | jq -r --arg t "$STATE_TITLE" 'map(select(.title==$t)) | .[0].number // empty' 2>/dev/null)
+  if [ -z "$num" ]; then
+    gh api -X POST "repos/$GITHUB_REPOSITORY/issues" \
+      -f title="$STATE_TITLE" -f body="round_no=$1" >/dev/null 2>&1 || true
+  else
+    gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/$num" \
+      -f body="round_no=$1" >/dev/null 2>&1 || true
+  fi
+}
+
 echo "== 预检：是否已有运行中的实例 =="
 EXISTING=$(oci --no-retry compute instance list \
   --compartment-id "$COMPARTMENT_ID" \
@@ -66,6 +108,7 @@ EXISTING=$(oci --no-retry compute instance list \
   --query 'data[0].id' --raw-output 2>/dev/null)
 if [ -n "$EXISTING" ] && [ "$EXISTING" != "None" ]; then
   echo "已存在运行中的实例 $EXISTING，跳过。"
+  write_round_no 0 || true
   send_notify "ARM实例已存在" "实例ID: $EXISTING"
   exit 0
 fi
@@ -179,6 +222,17 @@ if [ -n "$ALT_AD" ] && [ "$CAP" = "OUT_OF_HOST_CAPACITY" ]; then
   fi
 fi
 
+# ===== 本轮规格决策：正常 2 OCPU / 连续无货 STEP_ROUNDS 轮后降规格捡碎片 =====
+MISS_ROUNDS=$(read_round_no); MISS_ROUNDS=${MISS_ROUNDS:-0}
+MISS_ROUNDS=$((MISS_ROUNDS + 1))
+write_round_no "$MISS_ROUNDS" || true
+if [ "$STEP_OCPU_ENABLED" = "true" ] && [ "$MISS_ROUNDS" -ge "$STEP_ROUNDS" ]; then
+  THIS_OCPUS=$STEP_OCPUS; THIS_MEMORY=$STEP_MEMORY
+  echo "== 阶梯策略：已连续 $((MISS_ROUNDS - 1)) 轮无货，本轮降规格 ${THIS_OCPUS} OCPU/${THIS_MEMORY}GB 捡漏（抢到后自动扩回 ${OCPUS}/${MEMORY}）=="
+else
+  THIS_OCPUS=$OCPUS; THIS_MEMORY=$MEMORY
+fi
+
 i=0
 THROTTLE_STREAK=0
 START_TS=$(date +%s)
@@ -198,7 +252,7 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
     --availability-domain "$TARGET_AD" \
     --compartment-id "$COMPARTMENT_ID" \
     --shape "VM.Standard.A1.Flex" \
-    --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY}" \
+    --shape-config "{\"ocpus\":$THIS_OCPUS,\"memoryInGBs\":$THIS_MEMORY}" \
     --display-name "$DISPLAY_NAME" \
     --image-id "$IMAGE_ID" \
     --boot-volume-size-in-gbs "$BOOT_SIZE" \
@@ -217,13 +271,22 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
       --display-name "$DISPLAY_NAME" --lifecycle-state RUNNING \
       --query 'data[0].id' --raw-output 2>/dev/null)
     if [ -n "$EX" ] && [ "$EX" != "None" ]; then
-      echo "已存在实例 $EX"; send_notify "ARM实例已存在" "ID: $EX"; exit 0
+      echo "已存在实例 $EX"; write_round_no 0 || true
+      send_notify "ARM实例已存在" "ID: $EX"; exit 0
     fi
     echo "  配额已满，本轮停止。"; break
   elif echo "$RESULT" | grep -qiE "TooManyRequests|rate limit|Throttling"; then
     THROTTLE_STREAK=$((THROTTLE_STREAK + 1))
-    echo "  被限速，退避拉大间隔 (${INTERVAL}s -> $((INTERVAL + 30 > MAX_INTERVAL ? MAX_INTERVAL : INTERVAL + 30))s)...（连续第 ${THROTTLE_STREAK}/${MAX_THROTTLE_STREAK} 次）"
-    [ "$ADAPTIVE" = "true" ] && INTERVAL=$((INTERVAL + 30 > MAX_INTERVAL ? MAX_INTERVAL : INTERVAL + 30))
+    if [ "$ADAPTIVE" = "true" ]; then
+      if [ "$THROTTLE_STREAK" -lt "$FAST_RETRY_UNTIL" ]; then
+        # 连续限流前期：OCI 限流窗口常按分钟重置，短重试常能溜过去
+        INTERVAL=$MIN_INTERVAL
+        echo "  被限速（连续第 ${THROTTLE_STREAK} 次，<${FAST_RETRY_UNTIL}），快速重试仅等 ${INTERVAL}s..."
+      else
+        INTERVAL=$((INTERVAL + 30 > MAX_INTERVAL ? MAX_INTERVAL : INTERVAL + 30))
+        echo "  被限速，连续第 ${THROTTLE_STREAK} 次，退避拉大间隔到 ${INTERVAL}s..."
+      fi
+    fi
     if [ "$THROTTLE_STREAK" -ge "$MAX_THROTTLE_STREAK" ]; then
       echo "  连续 ${MAX_THROTTLE_STREAK} 次被限流，OCI 正在压我们的速率，提前收工等下一轮。"
       break
@@ -239,8 +302,16 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
       IP=$(query_ip)
       [ -n "$IP" ] && [ "$IP" != "None" ] && break
     done
-    echo "  [OK] 抢到了！ID=$ID IP=${IP:-获取中}"
+    echo "  [OK] 抢到了！ID=$ID IP=${IP:-获取中}（本轮规格 ${THIS_OCPUS} OCPU/${THIS_MEMORY}GB）"
+    # 阶梯规格抢到：立即 update shape 扩回全额（2 OCPU/12GB 在免费额度内）
+    if [ "$THIS_OCPUS" != "$OCPUS" ]; then
+      echo "  阶梯规格命中，自动扩回 ${OCPUS} OCPU/${MEMORY}GB..."
+      oci --no-retry compute instance update --instance-id "$ID" \
+        --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY}" 2>&1 | head -3 || \
+        echo "  （扩容命令返回异常，可事后手动: oci compute instance update --instance-id $ID --shape-config ...）"
+    fi
     echo "arm_ip=$IP" >> "${GITHUB_OUTPUT:-/dev/null}"
+    write_round_no 0 || true
     send_notify "[OK] ARM抢机成功" "区域: $TARGET_AD\n配置: $OCPUS OCPU/$MEMORY GB\nIP: ${IP:-查看控制台}\n登录: ssh -i oracle_arm_id_rsa ubuntu@${IP:-IP}"
     exit 0
   else
