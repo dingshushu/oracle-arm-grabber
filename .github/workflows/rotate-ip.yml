@@ -1,0 +1,232 @@
+name: OCI Rotate IP
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'plan=只读盘点; rotate=删除当前公网IP并新建保留IP'
+        type: choice
+        options:
+          - plan
+          - rotate
+        required: true
+      instance_name:
+        description: '实例显示名（精确匹配，如 amd）'
+        required: true
+        default: 'amd'
+      reserved_name:
+        description: '新保留IP显示名'
+        required: false
+        default: 'amd-reserved'
+
+permissions:
+  contents: write
+
+jobs:
+  rotate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OCI SDK
+        run: pip install --quiet oci
+
+      - name: Write OCI config & key
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+        run: |
+          mkdir -p $HOME/.oci
+          printf '%s\n' "$OCI_KEY" > $HOME/oci_key.pem
+          chmod 600 $HOME/oci_key.pem
+          printf '%s\n' "$OCI_CONFIG" > $HOME/.oci/config
+
+      - name: Run rotate tool
+        env:
+          ACTION: ${{ inputs.action }}
+          INSTANCE_NAME: ${{ inputs.instance_name }}
+          RESERVED_NAME: ${{ inputs.reserved_name }}
+        run: |
+          set -o pipefail
+          python3 - <<'PYEOF' 2>&1 | tee /tmp/result.txt
+          import os, sys, time
+          import oci
+
+          action = (os.environ.get('ACTION') or '').strip()
+          name = (os.environ.get('INSTANCE_NAME') or '').strip()
+          rname = (os.environ.get('RESERVED_NAME') or '').strip() or (name + '-reserved')
+
+          cfg = oci.config.from_file()
+          tenancy = cfg['tenancy']
+          identity = oci.identity.IdentityClient(cfg)
+          compute = oci.core.ComputeClient(cfg)
+          net = oci.core.VirtualNetworkClient(cfg)
+
+          def pages(fn, **kw):
+              return oci.pagination.list_call_get_all_results(fn, **kw).data
+
+          comps = [tenancy]
+          try:
+              for c in pages(identity.list_compartments, compartment_id=tenancy,
+                             compartment_id_in_subtree=True, lifecycle_state='ACTIVE'):
+                  comps.append(c.id)
+          except Exception as e:
+              print('compartment list warn:', e)
+
+          target = None
+          for cid in comps:
+              try:
+                  for inst in pages(compute.list_instances, compartment_id=cid):
+                      print('instance: %-16s %-10s %-16s %s' % (
+                          inst.display_name, inst.lifecycle_state, inst.shape, inst.id))
+                      if inst.display_name.lower() == name.lower() and inst.lifecycle_state == 'RUNNING':
+                          target = inst
+              except Exception as e:
+                  print('list_instances warn', cid, e)
+
+          if target is None:
+              print('ERROR: running instance not found: %s' % name)
+              sys.exit(1)
+          print('TARGET INSTANCE: %s  %s' % (target.display_name, target.id))
+
+          atts = pages(compute.list_vnic_attachments,
+                       compartment_id=target.compartment_id, instance_id=target.id)
+          prim = None
+          for a in atts:
+              v = net.get_vnic(a.vnic_id).data
+              print('vnic nic_index=%s private=%s public=%s id=%s' % (
+                  a.nic_index, v.private_ip, v.public_ip, v.id))
+              if a.nic_index == 0:
+                  prim = v
+          if prim is None and atts:
+              prim = net.get_vnic(atts[0].vnic_id).data
+          if prim is None:
+              print('ERROR: no vnic attached')
+              sys.exit(1)
+
+          priv = None
+          for p in pages(net.list_private_ips, vnic_id=prim.id):
+              print('private ip %s primary=%s id=%s' % (p.ip_address, p.is_primary, p.id))
+              if p.is_primary:
+                  priv = p
+          if priv is None:
+              print('ERROR: no primary private ip')
+              sys.exit(1)
+
+          def fmt(pb):
+              return 'ip=%s lifetime=%s state=%s id=%s' % (
+                  pb.ip_address, pb.lifetime, pb.lifecycle_state, pb.id)
+
+          cur = None
+          try:
+              cur = net.get_public_ip_by_private_ip_id(
+                  oci.core.models.GetPublicIpByPrivateIpIdDetails(private_ip_id=priv.id)).data
+              print('CURRENT PUBLIC IP: %s' % fmt(cur))
+          except oci.exceptions.ServiceError as e:
+              print('CURRENT PUBLIC IP: none (%s %s)' % (e.status, e.message))
+
+          if action == 'plan':
+              print('PLAN ONLY - no changes made')
+              sys.exit(0)
+
+          old_ip = cur.ip_address if cur else None
+          old_id = cur.id if cur else None
+          compartment_id = target.compartment_id
+
+          if old_id:
+              print('STEP: release old public ip %s (%s, lifetime=%s)' % (old_ip, old_id, cur.lifetime))
+              try:
+                  net.delete_public_ip(old_id)
+              except oci.exceptions.ServiceError as e:
+                  print('  delete err: %s %s' % (e.status, e.message))
+              gone = False
+              for i in range(50):
+                  try:
+                      g = net.get_public_ip(old_id).data
+                      print('  still: %s' % g.lifecycle_state)
+                  except oci.exceptions.ServiceError as e:
+                      if e.status == 404:
+                          gone = True
+                          print('  released (404)')
+                          break
+                      print('  poll err: %s %s' % (e.status, e.message))
+                  time.sleep(4)
+              print('  old ip released: %s' % gone)
+
+          new = None
+          for att in range(1, 6):
+              try:
+                  new = net.create_public_ip(oci.core.models.CreatePublicIpDetails(
+                      compartment_id=compartment_id, lifetime='RESERVED',
+                      display_name=rname)).data
+                  break
+              except oci.exceptions.ServiceError as e:
+                  print('create attempt %d err: %s %s' % (att, e.status, e.message))
+                  time.sleep(8)
+          if new is None:
+              print('ERROR: create reserved public ip failed')
+              sys.exit(1)
+          print('NEW RESERVED: %s' % fmt(new))
+
+          assigned = None
+          for att in range(1, 6):
+              try:
+                  net.update_public_ip(new.id, oci.core.models.UpdatePublicIpDetails(
+                      private_ip_id=priv.id))
+                  print('  assign request sent (attempt %d)' % att)
+              except oci.exceptions.ServiceError as e:
+                  print('  assign attempt %d err: %s %s' % (att, e.status, e.message))
+              for i in range(20):
+                  try:
+                      g = net.get_public_ip(new.id).data
+                  except oci.exceptions.ServiceError as e:
+                      print('  poll err: %s %s' % (e.status, e.message))
+                      time.sleep(4)
+                      continue
+                  print('  state=%s priv=%s' % (g.lifecycle_state, g.private_ip_id))
+                  if g.lifecycle_state == 'ASSIGNED' and g.private_ip_id == priv.id:
+                      assigned = g
+                      break
+                  time.sleep(4)
+              if assigned:
+                  break
+              time.sleep(5)
+
+          if assigned is None:
+              print('ERROR: assignment did not reach ASSIGNED')
+              sys.exit(1)
+
+          print('OLD_IP: %s' % (old_ip or 'none'))
+          print('NEW_IP: %s' % assigned.ip_address)
+          print('NEW_PUBLIC_IP_OCID: %s' % assigned.id)
+          print('VERDICT: %s -> %s' % (old_ip or 'none', assigned.ip_address))
+          PYEOF
+
+      - name: Publish result
+        if: always()
+        run: |
+          mkdir -p _automation
+          {
+            echo "# rotate-ip result"
+            echo
+            echo "- action: ${{ inputs.action }}"
+            echo "- instance: ${{ inputs.instance_name }}"
+            echo "- utc: $(date -u +%FT%TZ)"
+            echo
+            echo '```'
+            cat /tmp/result.txt 2>/dev/null || echo "(no output)"
+            echo '```'
+          } > _automation/rotate-ip-result.md
+          git config user.name wb-automation
+          git config user.email wb-automation@users.noreply.github.com
+          git add _automation/rotate-ip-result.md
+          git commit -m "rotate-ip result: ${{ inputs.action }} ${{ inputs.instance_name }}" || true
+          git pull --rebase --autostash || true
+          git push || true
