@@ -6,7 +6,7 @@ name: Grab Oracle ARM
 # 脚本侧同步：限流前 2 次 5s 快速重试（探测密度 4→10 次/轮）+ 连续 24 轮无货降 1 OCPU 捡漏。
 on:
   schedule:
-    - cron: '*/8 * * * *'          # 每 8 分钟；与 cron-job.org job 8620957 的 [0,8,16,...,56] 对齐
+    - cron: '*/8 * * * *'          # 每 8 分钟；与 cron-job.org job 8620957 的 [0,8,...,48] 对齐
   workflow_dispatch:         # 允许手动点一下立即运行（测试用）
     inputs:
       strict_skip:
@@ -34,9 +34,10 @@ jobs:
       SUBNET_ID: "ocid1.subnet.oc1.ap-singapore-1.aaaaaaaa2dnalbqseumn75ga3klzgpgbyk7jgh6r6riidtehul22yhauxtna"
       IMAGE_ID: "ocid1.image.oc1.ap-singapore-1.aaaaaaaaw75ef2chh5goomskvdznqz36cadczqelqvndbqcozc5icyig57za"
       # 节流阈值(秒)：两个触发源（GitHub cron */8 + cron-job.org job 8620957
-      # 的 [0,8,16,...,56] UTC）每分钟对齐点火，靠此门控去重——距上次任何触发
-      # 放行不足该值就直接退出。470s ≈ 8 分钟（留 10s 容忍 cron 漂移，
-      # 旧值 840s 是 5 分钟时代的产物，会让双源同分钟各跑一轮）。
+      # 的 [0,8,...,48] UTC）对齐点火，靠此门控去重——距上次**真正执行**的
+      # 一轮不足该值就直接退出。470s ≈ 8 分钟（留 10s 容忍 cron 漂移）。
+      # 2026-10-29：cron-job 的分钟表去掉 :56（它到 :00 只隔 4 分钟，每小时
+      # 必被闸门砍一次），改为 7 次/小时、间隔均匀。
       MIN_GAP_SECONDS: "470"
     steps:
       - name: Throttle gate（节流闸门）
@@ -51,6 +52,12 @@ jobs:
           # 注意：必须统计所有触发事件（schedule + workflow_dispatch）——
           # 旧版只统计 workflow_dispatch，GitHub cron 与 cron-job.org 同分钟
           # 各跑一轮时门控失效（schedule 的 run 不计入窗口）。
+          #
+          # 2026-10-29 修复「自锁误伤」：旧逻辑把**被闸门跳过的 run**也计入窗口，
+          # 一次跳过会挡住下一次（实测执行率被压到 62%，且整点 56→00 只隔 4 分钟
+          # 必被砍一轮）。现在只把「真正在跑/真跑过」的 run 视为占位：
+          #   - in_progress / queued            → 一定在跑，必须挡
+          #   - completed 且耗时 > 60s          → 真执行过（闸门跳过的 run 仅 7~25s）
           api="https://api.github.com/repos/${REPO}/actions/workflows/grab-oracle-arm.yml/runs?per_page=15"
           last=$(curl -sS -m 20 -H "Authorization: Bearer ${GH_TOKEN}" \
                  -H "Accept: application/vnd.github+json" "$api" \
@@ -58,9 +65,15 @@ jobs:
                    --argjson cur "${{ github.run_id }}" '
                      [ .workflow_runs[]
                        | select(.id != $cur)
-                       | select(.status == "completed" or .status == "in_progress" or .status == "queued")
+                       | select((($now - (.created_at|fromdateiso8601)) < $gap))
+                       | select(
+                           .status == "in_progress"
+                           or .status == "queued"
+                           or (.status == "completed"
+                               and ((.updated_at|fromdateiso8601)
+                                    - ((.run_started_at // .created_at)|fromdateiso8601)) > 60)
+                         )
                      ]
-                     | map(select((($now - (.created_at|fromdateiso8601)) < $gap)))
                      | length' 2>/dev/null || echo 0)
           if [ "${last:-0}" -gt 0 ]; then
             echo "距上次运行不足 ${MIN_GAP_SECONDS}s，本轮跳过（等效 8 分钟节奏）。"
@@ -104,7 +117,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}        # 阶梯 OCPU 状态机需读写本仓库 issue
           ADAPTIVE: "true"            # 自适应调速：被限速自动退避
           CAPACITY_PRECHECK: "true"   # 容量预检：每轮先查 Capacity Report
-          MAX_ATTEMPTS: "10"          # 单轮尝试次数（预检有货时自动加量到 15）
+          MAX_ATTEMPTS: "25"          # 单轮尝试次数（预检有货时自动加量到 30）；10→25 用满 400s 预算
           TIME_BUDGET: "400"          # 单轮时间预算(秒)：8 分钟节奏 + 9 分钟 job 超时内跑满
           MAX_THROTTLE_STREAK: "6"    # 限流容忍：连续 6 次才收工（前 2 次已改快速重试）
           STEP_OCPU_ENABLED: "true"   # 阶梯策略：连续 24 轮无货降 1 OCPU 捡漏，中奖即扩容回 2
