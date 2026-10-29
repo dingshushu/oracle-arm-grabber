@@ -12,6 +12,12 @@ on:
         description: '逗号分隔端口号，如 80,443'
         required: true
         default: '80,443'
+      proto:
+        description: '协议：tcp / udp / both'
+        type: choice
+        options: [tcp, udp, both]
+        default: tcp
+        required: true
 
 jobs:
   port:
@@ -37,40 +43,69 @@ jobs:
         env:
           ACTION: ${{ inputs.action }}
           PORTS: ${{ inputs.ports }}
+          PROTO: ${{ inputs.proto }}
         run: |
           set -e
-          SL="ocid1.securitylist.oc1.ap-singapore-1.aaaaaaaaozhglrhji2a4wcssgditmqp7jvhbjzcexrqhufp73td3z5rympmq"
           python3 - <<'PYEOF'
           import json, subprocess, os
-          action, ports = os.environ['ACTION'], os.environ['PORTS']
+          action = os.environ['ACTION']
+          ports  = os.environ['PORTS']
+          proto  = (os.environ.get('PROTO') or 'tcp').strip().lower()
+          SL = 'ocid1.securitylist.oc1.ap-singapore-1.aaaaaaaaozhglrhji2a4wcssgditmqp7jvhbjzcexrqhufp73td3z5rympmq'
+
           want = set(int(p) for p in ports.replace(' ', '').split(',') if p)
+          want_tcp = want if proto in ('tcp', 'both') else set()
+          want_udp = want if proto in ('udp', 'both') else set()
+
           cur = json.loads(subprocess.check_output([
               'oci', 'network', 'security-list', 'get',
-              '--security-list-id', 'ocid1.securitylist.oc1.ap-singapore-1.aaaaaaaaozhglrhji2a4wcssgditmqp7jvhbjzcexrqhufp73td3z5rympmq',
-              '--output', 'json']))['data']
+              '--security-list-id', SL, '--output', 'json']))['data']
           rules = cur['ingress-security-rules']
-          single_ports, keep = set(), []
+
+          tcp_ports, udp_ports, keep = set(), set(), []
           for r in rules:
-              tcp = (r.get('tcp-options') or {}).get('destination-port-range') if r.get('protocol') == '6' else None
-              if tcp and tcp['min'] == tcp['max']:
-                  single_ports.add(tcp['min'])
-              else:
-                  keep.append(r)   # 非单端口规则原样保留
+              p = str(r.get('protocol'))
+              if p == '6':
+                  d = (r.get('tcp-options') or {}).get('destination-port-range')
+                  if d and d['min'] == d['max']:
+                      tcp_ports.add(d['min'])
+                      continue
+              elif p == '17':
+                  d = (r.get('udp-options') or {}).get('destination-port-range')
+                  if d and d['min'] == d['max']:
+                      udp_ports.add(d['min'])
+                      continue
+              keep.append(r)   # 非单端口规则原样保留
+
           if action == 'open':
-              single_ports |= want
+              tcp_ports |= want_tcp
+              udp_ports |= want_udp
           else:
-              single_ports -= want
-          new_rules = keep + [{
-              'source': '0.0.0.0/0', 'source-type': 'CIDR_BLOCK',
-              'protocol': '6', 'is-stateless': False,
-              'tcp-options': {'destination-port-range': {'min': p, 'max': p}, 'source-port-range': None},
-          } for p in sorted(single_ports)]
+              tcp_ports -= want_tcp
+              udp_ports -= want_udp
+
+          new_rules = list(keep)
+          for p in sorted(tcp_ports):
+              new_rules.append({
+                  'source': '0.0.0.0/0', 'source-type': 'CIDR_BLOCK',
+                  'protocol': '6', 'is-stateless': False,
+                  'tcp-options': {'destination-port-range': {'min': p, 'max': p}, 'source-port-range': None},
+              })
+          for p in sorted(udp_ports):
+              new_rules.append({
+                  'source': '0.0.0.0/0', 'source-type': 'CIDR_BLOCK',
+                  'protocol': '17', 'is-stateless': False,
+                  'udp-options': {'destination-port-range': {'min': p, 'max': p}, 'source-port-range': None},
+              })
+
           subprocess.run(['oci', 'network', 'security-list', 'update',
-                          '--security-list-id', 'ocid1.securitylist.oc1.ap-singapore-1.aaaaaaaaozhglrhji2a4wcssgditmqp7jvhbjzcexrqhufp73td3z5rympmq',
+                          '--security-list-id', SL,
                           '--ingress-security-rules', json.dumps(new_rules), '--force'], check=True)
-          print(f'[{action}] 目标端口 {sorted(want)} -> 现有单端口: {sorted(single_ports)}')
+          print(f'[{action}/{proto}] 目标 {sorted(want)}')
+          print(f'  TCP 单端口: {sorted(tcp_ports)}')
+          print(f'  UDP 单端口: {sorted(udp_ports)}')
           PYEOF
       - name: Verify
         run: |
           oci network security-list get --security-list-id "ocid1.securitylist.oc1.ap-singapore-1.aaaaaaaaozhglrhji2a4wcssgditmqp7jvhbjzcexrqhufp73td3z5rympmq" \
-            --query 'data."ingress-security-rules"[].{proto:protocol,port:"tcp-options"."destination-port-range".min}' --output json
+            --query 'data."ingress-security-rules"[].{proto:protocol,tcp:"tcp-options"."destination-port-range".min,udp:"udp-options"."destination-port-range".min}' --output json
