@@ -2,17 +2,23 @@
 # Oracle Free Tier ARM 抢机脚本 —— 供 GitHub Actions 调用
 # 特性：
 #   1) 自适应调速：被 API 限速(429/Throttling)时自动拉大间隔退避，避免触发风控封号；
-#      正常缺货时保持紧凑节奏（5s），不浪费窗口。
-#   1b) 尝试次数自动调整：单轮时间预算(默认210s) + 连续限流上限(默认3次)双保险，
+#      正常缺货时也保持稳定节奏（55s），贴合 OCI 的 launch 限流窗口。
+#   1b) 尝试次数自动调整：单轮时间预算(默认900s) + 连续限流上限(默认8次)双保险，
 #       限流严重时提前收工，畅通时打满 MAX_ATTEMPTS——无需手改次数。
 #   2) 容量预检（Compute Capacity Report）：每轮先问 Oracle 当前 AD 是否有 A1 容量，
 #      仅当明确报 OUT_OF_HOST_CAPACITY 且开启 STRICT_SKIP 才跳过本轮，
 #      默认关闭严格跳过（只记录日志），避免误杀真实可用窗口。
 #   3) 全 AD 扫描 + 跨 AD 切换（MULTI_AD）：动态列出 tenancy 下所有 AD 并逐个探测容量，
 #      主 AD 无货但备用 AD 有货时，自动切换到有货 AD（需该 AD 有可用子网）。
-#   1c) 限流退避精细化（2026-10-17 深夜）：连续第 1/2 次被 429 限流只等 5s 快速重试
-#       （OCI 限流窗口常按分钟重置，短重试常能溜过去），连续第 3 次起才 +30s 长退避。
-#       实测旧逻辑"一被限流就 +30s"把每轮真实探测从 10 次压到 4 次，本优化直接翻倍探测密度。
+#      注：ap-singapore 只有 1 个 AD，此路径实际不会触发，保留仅为通用性。
+#   1c) 限流退避重写（2026-11-02）：旧逻辑"前 2 次被 429 只等 5s 快速重试"，依据是
+#      "OCI 限流窗口按分钟重置，短重试能溜过去"——实测证伪。逐条日志显示
+#      一次成功询价后**紧接的 3 次调用必然 429**（4 次全废，白烧 19.5s/周期），
+#      真正的窗口是 55~57s 量级。现改为：缺货后直接等 57s（一个完整窗口）；
+#      若仍被 429 说明只差几秒，补 15s 追上；连续 429 每次再加 15s（上限 90s）。
+#   1d) 睡前预判（2026-11-02）：旧逻辑先 sleep 再回循环头判断时间预算，导致每轮
+#      比预算多跑 28~35s；在 16 分钟节奏下会顶到下一轮触发。改为睡前算剩余预算，
+#      不够一个间隔就直接收工，让单轮总时长精确落在 TIME_BUDGET 附近。
 #   4) 阶梯 OCPU（2026-10-17 深夜）：连续 STEP_ROUNDS 轮无货后，本轮自动降规格
 #      (1 OCPU/6GB) 捡碎片容量——A1.Flex 容量按请求的 shape config 算，宿主只剩 1 核
 #      闲置时 2 核请求必败、1 核能中；抢到后立即 update shape 扩回 2 OCPU/12GB（免费额度内）。
@@ -28,13 +34,15 @@ OCPUS=2
 MEMORY=12
 BOOT_SIZE=100
 
-MAX_ATTEMPTS="${MAX_ATTEMPTS:-10}"   # 单轮尝试次数上限（硬顶）
-TIME_BUDGET="${TIME_BUDGET:-400}"    # 单轮时间预算(秒)：8 分钟触发节奏 + 9 分钟 job 超时
-MAX_THROTTLE_STREAK="${MAX_THROTTLE_STREAK:-6}"  # 连续被限流上限：超过说明 OCI 在压速率，提前收工
-INTERVAL=8                          # 当前尝试间隔（秒），自适应调整
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-35}"   # 单轮尝试次数上限（硬顶）
+TIME_BUDGET="${TIME_BUDGET:-900}"    # 单轮时间预算(秒)：16 分钟节奏内 setup 43s + 探测 900s
+MAX_THROTTLE_STREAK="${MAX_THROTTLE_STREAK:-12}"  # 连续被限流上限：超过说明 OCI 在压速率，提前收工
+INTERVAL=57                         # 当前尝试间隔（秒），自适应调整
 MIN_INTERVAL=5
-MAX_INTERVAL=120                    # 退避上限
-FAST_RETRY_UNTIL=3                  # 连续限流 <3 次：只等 MIN_INTERVAL 快速重试；>=3 才长退避
+MAX_INTERVAL=90                     # 退避上限
+STEADY_INTERVAL=57                  # 缺货后等满一个限流窗口：实测最小区间 55~57s，取 57 留 2s 余量
+FIRST_BACKOFF=15                    # 被 429 说明"差一点"，补 15s 即可（旧逻辑等整窗口会白烧一轮）
+BACKOFF_STEP=15                     # 连续被限流时每次再加 15s
 
 ADAPTIVE="${ADAPTIVE:-true}"            # 自适应调速开关
 CAPACITY_PRECHECK="${CAPACITY_PRECHECK:-true}"  # 容量预检开关
@@ -43,7 +51,7 @@ MULTI_AD="${MULTI_AD:-true}"            # 全 AD 扫描 + 跨 AD 切换开关
 STEP_OCPU_ENABLED="${STEP_OCPU_ENABLED:-true}"  # 阶梯 OCPU 总开关
 STEP_OCPUS="${STEP_OCPUS:-1}"           # 降规格档位
 STEP_MEMORY="${STEP_MEMORY:-6}"
-STEP_ROUNDS="${STEP_ROUNDS:-24}"        # 连续多少轮无货后启用降规格（24 轮≈8 分钟节奏下 3.2 小时）
+STEP_ROUNDS="${STEP_ROUNDS:-24}"        # 连续多少轮无货后启用降规格（24 轮≈16 分钟节奏下 6.4 小时）
 
 SSH_FILE=$HOME/id_rsa.pub
 printf '%s\n' "${SSH_KEY_PUB:-}" > "$SSH_FILE"
@@ -261,9 +269,9 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
     --ssh-authorized-keys-file "$SSH_FILE" 2>&1)
 
   if echo "$RESULT" | grep -qiE "Out of host capacity|Out of capacity"; then
-    echo "  没货，保持紧凑节奏。"
+    echo "  没货，按 ${STEADY_INTERVAL}s 稳定节奏继续（贴合限流窗口）。"
     THROTTLE_STREAK=0
-    [ "$ADAPTIVE" = "true" ] && INTERVAL=$MIN_INTERVAL
+    [ "$ADAPTIVE" = "true" ] && INTERVAL=$STEADY_INTERVAL
   elif echo "$RESULT" | grep -qiE "LimitExceeded"; then
     echo "  配额异常，复检是否已有实例..."
     sleep 5
@@ -278,17 +286,25 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
   elif echo "$RESULT" | grep -qiE "TooManyRequests|rate limit|Throttling"; then
     THROTTLE_STREAK=$((THROTTLE_STREAK + 1))
     if [ "$ADAPTIVE" = "true" ]; then
-      if [ "$THROTTLE_STREAK" -lt "$FAST_RETRY_UNTIL" ]; then
-        # 连续限流前期：OCI 限流窗口常按分钟重置，短重试常能溜过去
-        INTERVAL=$MIN_INTERVAL
-        echo "  被限速（连续第 ${THROTTLE_STREAK} 次，<${FAST_RETRY_UNTIL}），快速重试仅等 ${INTERVAL}s..."
+      if [ "$THROTTLE_STREAK" -eq 1 ]; then
+        # 2026-11-02 实测：一次成功询价后，下一次调用必须隔 55~57s。
+        # 若在这一刻被 429，说明只差几秒，补 15s 即可——旧逻辑"等满一个窗口"
+        # 会让该周期从 57s 膨胀到 112s，等于白丢一次询价。
+        INTERVAL=$FIRST_BACKOFF
+        echo "  被限速（连续第 ${THROTTLE_STREAK} 次），补 ${INTERVAL}s 追上窗口..."
       else
-        INTERVAL=$((INTERVAL + 30 > MAX_INTERVAL ? MAX_INTERVAL : INTERVAL + 30))
+        INTERVAL=$((INTERVAL + BACKOFF_STEP > MAX_INTERVAL ? MAX_INTERVAL : INTERVAL + BACKOFF_STEP))
         echo "  被限速，连续第 ${THROTTLE_STREAK} 次，退避拉大间隔到 ${INTERVAL}s..."
       fi
     fi
     if [ "$THROTTLE_STREAK" -ge "$MAX_THROTTLE_STREAK" ]; then
       echo "  连续 ${MAX_THROTTLE_STREAK} 次被限流，OCI 正在压我们的速率，提前收工等下一轮。"
+      break
+    fi
+    # 睡前预判：429 退避走的是本分支自己的 sleep，同样不能顶穿时间预算
+    _REMAIN=$(( TIME_BUDGET - ( $(date +%s) - START_TS ) ))
+    if [ "$INTERVAL" -gt "$_REMAIN" ]; then
+      echo "  剩余预算 ${_REMAIN}s 不足退避间隔 ${INTERVAL}s，提前收工。"
       break
     fi
     sleep "$INTERVAL"
@@ -317,7 +333,15 @@ while [ "$i" -lt "$MAX_ATTEMPTS" ]; do
   else
     echo "  未知返回:"; echo "$RESULT" | head -5
   fi
-  [ "$i" -lt "$MAX_ATTEMPTS" ] && sleep "$INTERVAL"
+  # 睡前预判（2026-11-02）：旧逻辑先 sleep 再回循环头判预算，每轮比 TIME_BUDGET
+  # 多跑 28~35s；900s 预算下会顶到下一轮触发。改为睡前算剩余预算，不够就收工。
+  ELAPSED=$(( $(date +%s) - START_TS ))
+  REMAIN=$(( TIME_BUDGET - ELAPSED ))
+  if [ "$i" -ge "$MAX_ATTEMPTS" ] || [ "$INTERVAL" -gt "$REMAIN" ]; then
+    [ "$i" -lt "$MAX_ATTEMPTS" ] && echo "  剩余预算 ${REMAIN}s 不足下次间隔 ${INTERVAL}s，提前收工。"
+    break
+  fi
+  sleep "$INTERVAL"
 done
 
 ELAPSED=$(( $(date +%s) - START_TS ))
