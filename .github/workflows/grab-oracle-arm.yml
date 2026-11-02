@@ -1,9 +1,17 @@
 name: Grab Oracle ARM
 
-# 策略（2026-10-17 深夜起）：每 8 分钟一轮、单轮深探测 400s。
-# 依据：A1 放货窗口常是几十秒~几分钟的瞬时窗口；仓库 public（Actions 分钟无限），
-# 提频的成本只是运行记录变多。8 分钟 × 400s 探测 ≈ 全天 83% 时间覆盖率。
-# 脚本侧同步：限流前 2 次 5s 快速重试（探测密度 4→10 次/轮）+ 连续 24 轮无货降 1 OCPU 捡漏。
+# 策略（2026-11-02 修订）：单轮深探测 900s，靠闸门收敛到 16 分钟一轮。
+# 依据（2026-11-02 抓取 7 轮完整日志实测）：
+#   1) OCI 对 compute instance launch 的限流窗口是 55~58s，与请求密度无关。
+#      一次成功询价后紧接 3 次调用必 429，再等 ~55s 才恢复；一小时物理上限约 65 次。
+#   2) 旧的 8 分钟/400s 轮次里，setup（pip install oci-cli ~39s）每小时重复 7.5 次，
+#      白烧约 8% 时间；且 MAX_ATTEMPTS=25 常在时间预算耗尽前就被用光
+#      （实测有一轮 345s 就跑完 25 次，剩 83s 空转）。
+#   3) 改为 900s 长轮后：setup 摊薄到 4%，有效询价从 41 次/小时升到约 59 次/小时（+44%）。
+# 触发源保持不变（GitHub cron */8 + cron-job.org job 8620957 的 [0,8,...,48] UTC），
+# 由 MIN_GAP_SECONDS=900 把多余触发全部挡掉，自然收敛为 :00/:16/:32/:48 节奏，
+# 因此不需要改 cron 表，也不需要动 cron-job.org。
+# 脚本侧同步：去掉 3 次 5s 空撞式快速重试（首次 429 即等满窗口）+ 睡前预判防超时。
 on:
   schedule:
     - cron: '*/8 * * * *'          # 每 8 分钟；与 cron-job.org job 8620957 的 [0,8,...,48] 对齐
@@ -23,7 +31,7 @@ concurrency:
 jobs:
   grab:
     runs-on: ubuntu-24.04   # 固定 LTS，避免 ubuntu-latest 于 2026-10-19 迁移 Ubuntu 26 引发意外
-    timeout-minutes: 9      # 单轮最长约 320s + setup ~90s，留足余量（原 6 分钟会截断深探测轮次）
+    timeout-minutes: 20     # 单轮 900s 探测 + setup ~43s ≈ 945s，20 分钟留足余量防截断
     permissions:
       issues: write
       actions: read          # 节流闸门需查询本 workflow 的历史运行
@@ -35,10 +43,11 @@ jobs:
       IMAGE_ID: "ocid1.image.oc1.ap-singapore-1.aaaaaaaaw75ef2chh5goomskvdznqz36cadczqelqvndbqcozc5icyig57za"
       # 节流阈值(秒)：两个触发源（GitHub cron */8 + cron-job.org job 8620957
       # 的 [0,8,...,48] UTC）对齐点火，靠此门控去重——距上次**真正执行**的
-      # 一轮不足该值就直接退出。470s ≈ 8 分钟（留 10s 容忍 cron 漂移）。
-      # 2026-10-29：cron-job 的分钟表去掉 :56（它到 :00 只隔 4 分钟，每小时
-      # 必被闸门砍一次），改为 7 次/小时、间隔均匀。
-      MIN_GAP_SECONDS: "470"
+      # 一轮不足该值就直接退出。
+      # 2026-11-02：470 → 900。单轮时长加到 ~945s 后，8 分钟粒度的触发点里
+      # 只有「隔 16 分钟」的那个能通过闸门（隔 8 分钟时上一轮还在跑），
+      # 于是自动收敛为 :00/:16/:32/:48 的 16 分钟节奏，cron 表无需改动。
+      MIN_GAP_SECONDS: "900"
     steps:
       - name: Throttle gate（节流闸门）
         id: gate
@@ -76,7 +85,7 @@ jobs:
                      ]
                      | length' 2>/dev/null || echo 0)
           if [ "${last:-0}" -gt 0 ]; then
-            echo "距上次运行不足 ${MIN_GAP_SECONDS}s，本轮跳过（等效 8 分钟节奏）。"
+            echo "距上次运行不足 ${MIN_GAP_SECONDS}s，本轮跳过（等效 16 分钟节奏）。"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "距上次运行已超过 ${MIN_GAP_SECONDS}s，本轮正常执行。"
@@ -117,9 +126,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}        # 阶梯 OCPU 状态机需读写本仓库 issue
           ADAPTIVE: "true"            # 自适应调速：被限速自动退避
           CAPACITY_PRECHECK: "true"   # 容量预检：每轮先查 Capacity Report
-          MAX_ATTEMPTS: "25"          # 单轮尝试次数（预检有货时自动加量到 30）；10→25 用满 400s 预算
-          TIME_BUDGET: "400"          # 单轮时间预算(秒)：8 分钟节奏 + 9 分钟 job 超时内跑满
-          MAX_THROTTLE_STREAK: "6"    # 限流容忍：连续 6 次才收工（前 2 次已改快速重试）
+          MAX_ATTEMPTS: "35"          # 单轮尝试次数：900s ÷ 57s ≈ 16 次有效询价 + 429 余量（预检有货时自动 +5）
+          TIME_BUDGET: "900"          # 单轮时间预算(秒)：16 分钟节奏内 setup 43s + 探测 900s
+          MAX_THROTTLE_STREAK: "12"   # 限流容忍：900s 长轮内允许 12 次连续限流（补差式退避，不会空烧）
           STEP_OCPU_ENABLED: "true"   # 阶梯策略：连续 24 轮无货降 1 OCPU 捡漏，中奖即扩容回 2
           STRICT_SKIP: ${{ github.event.inputs.strict_skip || 'false' }}   # 默认不跳过（防误杀）；手动可勾选严格模式
         run: bash grab_arm_action.sh
