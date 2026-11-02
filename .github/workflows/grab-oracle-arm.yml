@@ -23,9 +23,15 @@ on:
         required: false
         default: false
 
-# 同一时间只跑一个实例，避免重叠造成重复 API 调用、被限流
+# 2026-11-02：group 改为 per-run 唯一值。
+# 原来固定 group 会让 8 分钟触发的 run **排队**而不是退出——排队期间闸门根本不执行，
+# 等前一轮结束才轮到它，此时闸门看到的是「当前时刻」，早已超出 MIN_GAP，于是照样放行。
+# 实测 #4985（14:08 触发）跑到 14:23:45，#4986（14:16 触发）排队 7.7 分钟后仍在
+# 14:23:51 启动，队列因此会持续堆积。
+# 改成唯一 group 后，被闸门挡掉的 run 会在 8~13s 内立即退出；
+# 互斥仍由闸门保证（它已检测 in_progress / queued 状态）。
 concurrency:
-  group: grab-arm
+  group: grab-arm-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
